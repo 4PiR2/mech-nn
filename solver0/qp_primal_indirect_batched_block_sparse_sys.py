@@ -1,16 +1,28 @@
 import torch
 from torch.autograd import Function
+import numpy as np
 
+#from sksparse.cholmod import cholesky, cholesky_AAt, analyze, analyze_AAt
+
+import scipy.sparse.linalg as spla
+import scipy.linalg as spl
+
+import scipy.sparse as SP
+import torch.linalg as TLA
+
+
+import solver.cg as cg
 from config import ODEConfig as config
-from solver.cg import cg_block
-from solver.lp_sparse_forward_diff import ODESYSLP
 
 
 def block_mv(A, x):
     """shape x: (b, d), A sparse block"""
-    y = (A @ x.flatten()).reshape(x.size(0), -1)
-    return y
+    b = x.shape[0]
+    x = x.reshape(-1)
 
+    y = torch.mv(A, x)
+    y = y.reshape(b, -1)
+    return y
 
 def solve_kkt_indirect_cg(A, AAt, g, h, gamma):
     """
@@ -22,19 +34,35 @@ def solve_kkt_indirect_cg(A, AAt, g, h, gamma):
             p := x*
             G := gamma*I
     """
-    rhs1 = block_mv(A, g) - gamma * h
+    At = A.t() #transpose(1,2)
+    rhs1 = block_mv(A,g) - gamma*h
+    #y = torch.cholesky_solve(rhs1, L)
+    #y = y
 
-    y, info = cg_block(AAt, rhs1, maxiter=config.cg_max_iter)
+    #rhs = cupy.asarray(rhs1.squeeze())#.cpu().numpy()
+    #print('starting ')
+    #rhs = rhs1.squeeze(-1)
+    y,info = cg.cg_block(AAt, rhs1, maxiter=config.cg_max_iter)
+    #res = rhs1 - block_mv(AAt,y)
+    #print('done ', res.mean().item() )
+    
+    p = block_mv(At,y) - g
+    p = p/gamma
+    
+    return p,y
 
-    p = block_mv(A.t(), y) - g
-    p /= gamma
 
-    return p, y
+def QPFunction(ode, n_iv, order, n_step=10, gamma=1, alpha=1, double_ret=True):
 
-
-def QPFunction(ode: ODESYSLP, n_iv, order, n_step=10, gamma=1, alpha=1, double_ret=True):
 
     class QPFunctionFn(Function):
+        #csr_rows = None
+        #csr_cols = None
+        #nnz = None
+        #QRSolver = None
+        #dim = None
+        #perm = None
+
         @staticmethod
         def forward(ctx, eq_A, rhs, iv_rhs, derivative_A):
         #def forward(ctx, coeffs, rhs, iv_rhs):
@@ -48,6 +76,8 @@ def QPFunction(ode: ODESYSLP, n_iv, order, n_step=10, gamma=1, alpha=1, double_r
 
             #A = ode.A
             #ub = ode.ub
+
+            #ipdb.set_trace()
 
             c = torch.zeros(bs, ode.num_vars).type_as(rhs)
             #print("c ", c.dtype, c.shape, At.shape)
@@ -91,8 +121,9 @@ def QPFunction(ode: ODESYSLP, n_iv, order, n_step=10, gamma=1, alpha=1, double_r
             #x,y = solve_kkt_sparse_qr(A,c, -b, gamma, QPFunctionFn.QRSolver, values)
             #x,y = solve_kkt_indirect(A,AAt_sp,c, -b, gamma)
             #x,y = solve_kkt_indirect(A,AAt_sp,c, -b, gamma)
-            x,y = solve_kkt_indirect_cg(A, AAt, c, -b, gamma)
-
+            x,y = solve_kkt_indirect_cg(A,AAt,c, -b, gamma)
+            
+            
             ctx.save_for_backward(A, AAt, x, y)
             
             if not double_ret:
@@ -132,7 +163,9 @@ def QPFunction(ode: ODESYSLP, n_iv, order, n_step=10, gamma=1, alpha=1, double_r
             #remove eps
             #dnu = _dnu[:, 1:1+num_coeffs]
             #nu = nu[:, 1:1+num_coeffs]
+            
 
+            
             #dA = torch.tensor(dA)#.sum(dim=0)
             #db = _dx[:, :2*n_step] #torch.tensor(-dnu.squeeze())
             #db = _dx[:, :n_step*ode.n_equations] #torch.tensor(-dnu.squeeze())

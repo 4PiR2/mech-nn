@@ -1,5 +1,5 @@
-
 from enum import Enum
+
 
 class SolverType(Enum):
     DENSE_CHOLESKY = 1
@@ -11,8 +11,6 @@ class SolverType(Enum):
 class ODEConfig:
     linear_solver = SolverType.DENSE_CHOLESKY
 
-    #uncomment to choose linear solver sparse conjuate gradient
-    #linear_solver = SolverType.SPARSE_INDIRECT_BLOCK_CG
-    #cg_max_iter = 200
-
-
+    # uncomment to choose linear solver sparse conjuate gradient
+    # linear_solver = SolverType.SPARSE_INDIRECT_BLOCK_CG
+    cg_max_iter = 200

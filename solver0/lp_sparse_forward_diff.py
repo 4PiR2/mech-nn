@@ -1,27 +1,25 @@
-from enum import Enum, IntEnum
-import math
-
 import numpy as np
 import torch
-import torch.nn as nn
+import math
+#import scipy.sparse as sp
 import scipy.sparse as SP
-
+import scipy.optimize as spopt
+import torch.nn as nn
+from enum import Enum, IntEnum
+import ipdb
 
 class VarType(Enum):
     EPS = 1
     Mesh = 10
-
 
 class ConstraintType(Enum):
     Equation = 1
     Initial = 10
     Derivative = 20
 
-
 class Const(IntEnum):
     #placeholder
     PH = -100 
-
 
 class ODESYSLP(nn.Module):
     def __init__(self, bs=1, n_step=3, n_dim=1,  n_iv=2, n_auxiliary=0, n_equations=1, step_size=0.25, order=2, 
@@ -565,7 +563,9 @@ class ODESYSLP(nn.Module):
         derivative_indices = self.derivative_A._indices()
         G = torch.sparse_coo_tensor(derivative_indices, derivative_values, dtype=self.dtype, device=steps.device)
 
+        #return G, derivative_values
         return G#, derivative_values
+
 
 
     def fill_block_constraints_torch(self, eq_A, eq_rhs, iv_rhs, derivative_A):
@@ -740,7 +740,7 @@ def test():
 
         ode = ODESYSLP(bs=1, n_dim=dim, n_equations=1, n_auxiliary=0, n_step=n_step, step_size=0.1, order=2, n_iv=1, device='cpu', step_list=_steps)
 
-        derivative_constraints, deriv_values = ode.build_derivative_tensor(steps)
+        derivative_constraints,deriv_values = ode.build_derivative_tensor(steps)
         #eq_constraints = self.ode.build_equation_tensor(coeffs)
 
         fix_values = ode.value_dict[ConstraintType.Derivative]
@@ -753,6 +753,6 @@ def test():
         print(diff)
         print(diff.mean())
 
-
-if __name__ == '__main__':
+if __name__=="__main__":
+    #ODESYSLP().ode()
     test()

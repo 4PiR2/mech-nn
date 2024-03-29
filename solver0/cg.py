@@ -1,13 +1,16 @@
-# Batched sparse conjugate gradient adapted from cupy cg
+#Batched sparse conjugate gradient adapted from cupy cg
 
 import torch
-
+import ipdb
 
 def block_mv(A, x):
     """shape x: (b, d), A sparse block"""
-    y = (A @ x.flatten()).reshape(x.size(0), -1)
-    return y
+    b = x.shape[0]
+    x = x.reshape(-1)
 
+    y = torch.mv(A, x)
+    y = y.reshape(b, -1)
+    return y
 
 def cg_block(A, b, x0=None, tol=1e-12, maxiter=None, M=None, callback=None,
        atol=None):
