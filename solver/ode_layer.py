@@ -1,13 +1,7 @@
 import torch
 import torch.nn as nn
 
-from config import ODEConfig, SolverType
 from solver.lp_sparse_forward_diff import ODESYSLP
-
-if ODEConfig.linear_solver == SolverType.DENSE_CHOLESKY:
-    from solver.qp_primal_direct_batched_sparse_sys import QPFunction as QPFunctionSys
-if ODEConfig.linear_solver == SolverType.SPARSE_INDIRECT_BLOCK_CG:
-    from solver.qp_primal_indirect_batched_block_sparse_sys import QPFunction as QPFunctionSys
 
 
 class ODEINDLayer(nn.Module):
@@ -16,12 +10,11 @@ class ODEINDLayer(nn.Module):
         super().__init__()
         # placeholder step size
         self.step_size = 0.1
-        #self.end = n_step * self.step_size
-        self.n_step = n_step #int(self.end / self.step_size)
+        self.n_step = n_step  # int(self.end / self.step_size)
         self.order = order
 
         self.n_ind_dim = n_ind_dim
-        self.n_dim = 1 #n_dim
+        self.n_dim = 1  # n_dim
         self.n_equations =1 # n_equations
         self.n_iv = n_iv
         self.n_iv_steps = n_iv_steps
@@ -43,10 +36,7 @@ class ODEINDLayer(nn.Module):
             device=self.device,
         )
 
-        self.qpf = QPFunctionSys(
-            self.ode, n_step=self.n_step, order=self.order, n_iv=self.n_iv, gamma=gamma, alpha=alpha,
-            double_ret=double_ret,
-        )
+        self.gamma_alpha = gamma * alpha
 
     def forward(self, coeffs, rhs, iv_rhs, steps):
         coeffs = coeffs.reshape(self.bs * self.n_ind_dim, self.n_step, self.n_dim, self.order + 1)
@@ -66,9 +56,20 @@ class ODEINDLayer(nn.Module):
         derivative_constraints = self.ode.build_derivative_tensor(steps)
         eq_constraints = self.ode.build_equation_tensor(coeffs)
 
-        x = self.qpf(eq_constraints, rhs, iv_rhs, derivative_constraints)
+        self.ode.build_ode(eq_constraints, rhs, iv_rhs, derivative_constraints)
+        A = self.ode.AG.to_dense()
+        beta = self.ode.ub.to(dtype=A.dtype)
 
-        eps = x[:, 0]
+        A = A[..., 1:]
+        At = A.transpose(-2, -1)
+        AtA = At @ A
+        L, info = torch.linalg.cholesky_ex(AtA, upper=False, check_errors=False)
+        rhs = At @ beta[..., None]
+        # rhs[..., 0, :] += self.gamma_alpha
+        x = rhs.cholesky_solve(L, upper=False)[..., 0]
+
+        # eps = x[:, 0]
+        eps = torch.zeros_like(x[:, 0])
 
         # shape: batch, step, vars (== 1), order
         u = self.ode.get_solution_reshaped(x)
@@ -113,7 +114,7 @@ class ODESYSLayer(nn.Module):
         self.ode = ODESYSLP(bs=bs*self.n_ind_dim, n_dim=self.n_dim, n_equations=n_equations, n_auxiliary=0, n_step=self.n_step, step_size=self.step_size, order=self.order,
                         periodic_boundary=periodic_boundary, n_iv=self.n_iv, n_iv_steps=self.n_iv_steps, dtype=dtype, device=self.device)
 
-        self.qpf = QPFunctionSys(self.ode, n_step=self.n_step, order=self.order, n_iv=self.n_iv, gamma=gamma, alpha=alpha, double_ret=double_ret)
+        self.gamma_alpha = gamma * alpha
 
     def forward(self, coeffs, rhs, iv_rhs, steps):
         coeffs = coeffs.reshape(self.bs*self.n_ind_dim, self.n_equations, self.n_step,self.n_dim, self.order + 1)

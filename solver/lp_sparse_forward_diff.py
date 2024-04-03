@@ -173,7 +173,8 @@ class ODESYSLP:
 
     def get_solution_reshaped(self, x):
         """remove eps and reshape solution"""
-        x = x[:, 1:].reshape(-1, *self.multi_index_shape)
+        # x = x[:, 1:].reshape(-1, *self.multi_index_shape)
+        x = x.reshape(-1, *self.multi_index_shape)
         return x
 
     def _add_constraint(self, var_list, values, rhs, constraint_type):
@@ -306,29 +307,6 @@ class ODESYSLP:
         G = torch.sparse_coo_tensor(indices=derivative_indices, values=derivative_values, dtype=self.dtype,
                                     device=steps.device)
         return G
-
-    def fill_block_constraints_torch(self, eq_A, eq_rhs, iv_rhs, derivative_A):
-        eq_values = eq_A._values().reshape(self.bs, -1)
-        if iv_rhs is not None:
-            self.initial_A = self.initial_A.type_as(derivative_A)
-            init_values = self.initial_A._values().reshape(self.bs, -1)
-        deriv_values = derivative_A._values().reshape(self.bs, -1)
-
-        if iv_rhs is not None:
-            values = torch.cat([eq_values, init_values, deriv_values], dim=1)
-        else:
-            values = torch.cat([eq_values, deriv_values], dim=1)
-        values = values.reshape(-1)
-
-        self.A_block_indices = self.A_block_indices.to(values.device)
-        A_block = torch.sparse_coo_tensor(indices=self.A_block_indices, values=values, size=self.A_block_shape)
-        self.derivative_rhs = self.derivative_rhs.type_as(eq_rhs)
-
-        if iv_rhs is not None:
-            rhs = torch.cat([eq_rhs, iv_rhs, self.derivative_rhs], dim=1)
-        else:
-            rhs = torch.cat([eq_rhs, self.derivative_rhs], dim=1)
-        return A_block, rhs
 
     def build_ode(self, eq_A, eq_rhs, iv_rhs, derivative_A):
         if derivative_A is None:

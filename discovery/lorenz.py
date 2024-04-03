@@ -135,10 +135,7 @@ class Model(nn.Module):
 
         steps = self.step_size.type_as(net_iv).sigmoid().repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1)
 
-        x0_0, x1_0, x2_0, eps_0, steps_0 = self.ode0(coeffs, rhs, var[:, 0], steps)
         x0, x1, x2, eps, steps = self.ode(coeffs, rhs, var[:, 0], steps)
-
-        diffs = [v.abs().max().item() for v in [x0 - x0_0, x1 - x1_0, x2 - x2_0, eps - eps_0, steps - steps_0]]
 
         x0 = x0.permute(0, 2, 1)
 
@@ -189,10 +186,10 @@ def main():
     threshold = 0.1
 
     ds = LorenzDataset(STEP, n_step=T, n_step_per_batch=n_step_per_batch)
-    train_loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=8, drop_last=True)
+    train_loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
 
     # plot train data
-    # P.plot_lorenz(ds.x_train, os.path.join(log_dir, 'train.pdf'))
+    P.plot_lorenz(ds.x_train, os.path.join(log_dir, 'train.pdf'))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -218,9 +215,9 @@ def main():
             L.info(model.mask * mask)
 
         # simulate and plot
-        # code = print_eq(model, ds.basis_vars, L, stdout=True)
-        # x_sim = simulate(code, T, STEP)  # (10000, 3)
-        # P.plot_lorenz(x_sim, os.path.join(log_dir, f'sim_{step}.pdf'))
+        code = print_eq(model, ds.basis_vars, L, stdout=True)
+        x_sim = simulate(code, T, STEP)  # (10000, 3)
+        P.plot_lorenz(x_sim, os.path.join(log_dir, f'sim_{step}.pdf'))
 
         # set mask
         if step > 0:
