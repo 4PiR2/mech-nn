@@ -4,13 +4,11 @@ import math
 from typing import Dict, List
 
 import numpy as np
-import scipy
 import torch
 
 
 class VarType(Enum):
     EPS = 1
-    Mesh = 10
 
 
 class ConstraintType(Enum):
@@ -19,8 +17,7 @@ class ConstraintType(Enum):
     Derivative = 20
 
 
-class Const(IntEnum):
-    PH = -100  # placeholder
+PH = torch.nan  # placeholder
 
 
 class ODESYSLP:
@@ -46,8 +43,6 @@ class ODESYSLP:
         self.step_list = torch.full([n_step - 1], step_size) if step_list is None else step_list
 
         # initial constraint steps starting from step 0
-        self.n_iv_steps: int = n_iv_steps
-        self.periodic_boundary: bool = periodic_boundary
         self.num_constraints: int = 0
 
         # tracks number of added constraints
@@ -58,15 +53,10 @@ class ODESYSLP:
 
         # order is diffeq order. n_order is total number of terms: y'', y', y for order 2.
         self.n_order: int = order + 1
-        # number of initial values
-        self.n_iv: int = n_iv
         # number of ode variables
-        self.n_dim: int = n_dim
         # number of auxiliary variables per dim for non-linear terms
-        self.n_auxiliary: int = n_auxiliary
         # dimensions plus n_auxliary vars for each dim
-        self.n_system_vars: int = self.n_dim + self.n_dim * self.n_auxiliary
-        self.n_equations: int = n_equations
+        self.n_system_vars: int = n_dim * (1 + n_auxiliary)
         # batch size
         self.bs: int = bs
         self.dtype = dtype
@@ -89,30 +79,26 @@ class ODESYSLP:
         # rhs values
         self.rhs_dict = {ConstraintType.Equation: [], ConstraintType.Initial: [], ConstraintType.Derivative: []}
 
-        # mask values
-        self.mask_value_dict = {ConstraintType.Equation: [], ConstraintType.Initial: [], ConstraintType.Derivative: []}
-
         # build skeleton constraints. filled during training
-        # self._build_equation_constraints()
         # one equation for each dimension
-        for _ in range(self.n_equations):
+        for _ in range(n_equations):
             for step in range(self.n_step):
                 var_list = list(itertools.product([step], range(self.n_system_vars), range(self.n_order)))
-                val_list = [Const.PH] * len(var_list)
-                self._add_constraint(var_list=var_list, values=val_list, rhs=Const.PH,
+                val_list = [PH] * len(var_list)
+                self._add_constraint(var_list=var_list, values=val_list, rhs=PH,
                                      constraint_type=ConstraintType.Equation)
 
         self._build_derivative_constraints()
 
         # self._build_initial_constraints()
         # equation coefficients over grid
-        for step, dim, i in itertools.product(range(self.n_iv_steps), range(self.n_dim), range(self.n_iv)):
-            self._add_constraint(var_list=[(step, dim, i)], values=[1], rhs=Const.PH,
+        for step, dim, i in itertools.product(range(n_iv_steps), range(n_dim), range(n_iv)):
+            self._add_constraint(var_list=[(step, dim, i)], values=[1], rhs=PH,
                                  constraint_type=ConstraintType.Initial)
-        if self.periodic_boundary:
-            for dim, order in itertools.product(range(self.n_dim), range(self.n_order - 1)):
+        if periodic_boundary:
+            for dim, order in itertools.product(range(n_dim), range(self.n_order - 1)):
                 self._add_constraint(var_list=[(0, dim, order), (self.n_step - 1, dim, order)], values=[1, -1],
-                                     rhs=Const.PH, constraint_type=ConstraintType.Initial)
+                                     rhs=PH, constraint_type=ConstraintType.Initial)
 
         eq_A = torch.sparse_coo_tensor(
             indices=torch.tensor([self.row_dict[ConstraintType.Equation], self.col_dict[ConstraintType.Equation]]),
@@ -135,7 +121,7 @@ class ODESYSLP:
         self.derivative_rhs = torch.tensor(self.rhs_dict[ConstraintType.Derivative], dtype=self.dtype,
                                            device=self.device).repeat(self.bs, 1)
 
-        if self.n_iv > 0:
+        if n_iv > 0:
             initial_A = torch.sparse_coo_tensor(
                 indices=torch.tensor([self.row_dict[ConstraintType.Initial], self.col_dict[ConstraintType.Initial]]),
                 values=self.value_dict[ConstraintType.Initial],
@@ -150,26 +136,6 @@ class ODESYSLP:
             self.initial_A = None
 
         self.num_constraints: int = full_A.size(0)
-
-        # build_block_diag
-        A_mat = scipy.sparse.coo_matrix((full_A._values(), (full_A._indices()[0], full_A._indices()[1])),
-                                        shape=full_A.shape)
-        A_block = scipy.sparse.block_diag([A_mat] * self.bs)
-        self.A_block_indices = torch.tensor(np.stack([A_block.row, A_block.col], axis=0))
-        self.A_block_shape = A_block.shape
-
-        # set_row_col_sorted_indices
-        ############## derivative indices sorted and counted
-        derivative_rows = np.array(self.row_dict[ConstraintType.Derivative])
-        derivative_columns = np.array(self.col_dict[ConstraintType.Derivative])
-        self.derivative_row_sorted, self.derivative_column_sorted, self.derivative_row_counts, self.derivative_column_counts \
-            = self._get_row_col_sorted_indices(derivative_rows, derivative_columns)
-
-        ###############equation indices sorted and counted
-        eq_rows = np.array(self.row_dict[ConstraintType.Equation])
-        eq_columns = np.array(self.col_dict[ConstraintType.Equation])
-        self.eq_row_sorted, self.eq_column_sorted, self.eq_row_counts, self.eq_column_counts = self._get_row_col_sorted_indices(
-            eq_rows, eq_columns)
 
     def get_solution_reshaped(self, x):
         """remove eps and reshape solution"""
@@ -212,7 +178,6 @@ class ODESYSLP:
 
         for step, dim, i in itertools.product(range(self.n_step - 1), range(self.n_system_vars),
                                               range(self.n_order - 1)):
-            # TODO handle corners for derivatives
             # forward constraints
             var_list = [VarType.EPS, (step + 1, dim, i)]
             val_list = [1., -sign * self.step_list[step] ** i]
@@ -324,38 +289,3 @@ class ODESYSLP:
             self.ub = torch.cat([eq_rhs, iv_rhs, self.derivative_rhs], dim=1)
         else:
             self.ub = torch.cat([eq_rhs, self.derivative_rhs], dim=1)
-
-    def sparse_grad_derivative_constraint(self, x, y):
-        """ sparse x y' for derivative constraint"""
-        # copy x across columns. copy y across rows
-        x = x[:,
-            self.num_added_equation_constraints + self.num_added_initial_constraints: self.num_added_equation_constraints + self.num_added_initial_constraints + self.num_added_derivative_constraints]
-        y = y[:, :self.num_vars]
-
-        self.derivative_row_counts = self.derivative_row_counts.to(x.device)
-        self.derivative_column_counts = self.derivative_column_counts.to(x.device)
-
-        x_repeat = torch.repeat_interleave(x.flatten(start_dim=1), self.derivative_row_counts, dim=-1).flatten()
-        y_repeat = torch.repeat_interleave(y.flatten(start_dim=1), self.derivative_column_counts, dim=-1).flatten()
-
-        X = torch.sparse_coo_tensor(self.derivative_row_sorted, x_repeat, dtype=self.dtype, device=x.device)
-        Y = torch.sparse_coo_tensor(self.derivative_column_sorted, y_repeat, dtype=self.dtype, device=x.device)
-        dD = X * Y
-        return dD
-
-    def sparse_grad_eq_constraint(self, x, y):
-        """ sparse x y' for eq constraint"""
-        # copy x across columns. copy y across rows
-        x = x[:, 0:self.num_added_equation_constraints]
-        y = y[:, 1:self.num_vars]
-
-        self.eq_row_counts = self.eq_row_counts.to(x.device)
-        self.eq_column_counts = self.eq_column_counts.to(x.device)
-
-        x_repeat = torch.repeat_interleave(x.flatten(start_dim=1), self.eq_row_counts, dim=-1).flatten()
-        y_repeat = torch.repeat_interleave(y.flatten(start_dim=1), self.eq_column_counts, dim=-1).flatten()
-
-        X = torch.sparse_coo_tensor(self.eq_row_sorted, x_repeat, dtype=self.dtype, device=x.device)
-        Y = torch.sparse_coo_tensor(self.eq_column_sorted, y_repeat, dtype=self.dtype, device=x.device)
-        dD = X * Y
-        return dD
