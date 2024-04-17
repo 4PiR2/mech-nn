@@ -31,7 +31,7 @@ class ODEINDLayer(nn.Module):
         dtype = torch.float64 if self.solver_dbl else torch.float32
 
         self.ode = ODESYSLP(
-            bs=bs*self.n_ind_dim, n_dim=self.n_dim, n_equations=self.n_equations, n_auxiliary=0, n_step=self.n_step,
+            bs=bs*self.n_ind_dim, n_dim=self.n_dim, n_equations=self.n_equations, n_auxiliary=0, n_steps=self.n_step,
             step_size=self.step_size, order=self.order, n_iv=self.n_iv, n_iv_steps=self.n_iv_steps, dtype=dtype,
             device=self.device,
         )
@@ -63,7 +63,7 @@ class ODEINDLayer(nn.Module):
         At = A.transpose(-2, -1)
         AtA = At @ A
         L, info = torch.linalg.cholesky_ex(AtA, upper=False, check_errors=False)
-        rhs = At @ beta[..., None]
+        rhs = At[..., :beta.size(-1)] @ beta[..., None]
         # rhs[..., 0, :] += self.gamma_alpha
         x = rhs.cholesky_solve(L, upper=False)[..., 0]
 
@@ -110,8 +110,8 @@ class ODESYSLayer(nn.Module):
 
         dtype = torch.float64 if solver_dbl else torch.float32
 
-        self.ode = ODESYSLP(bs=bs*self.n_ind_dim, n_dim=self.n_dim, n_equations=n_equations, n_auxiliary=0, n_step=self.n_step, step_size=self.step_size, order=self.order,
-                        periodic_boundary=periodic_boundary, n_iv=self.n_iv, n_iv_steps=self.n_iv_steps, dtype=dtype, device=self.device)
+        self.ode = ODESYSLP(bs=bs*self.n_ind_dim, n_dim=self.n_dim, n_equations=n_equations, n_auxiliary=0, n_steps=self.n_step, step_size=self.step_size, order=self.order,
+                            periodic_boundary=periodic_boundary, n_iv=self.n_iv, n_iv_steps=self.n_iv_steps, dtype=dtype, device=self.device)
 
         self.gamma_alpha = gamma * alpha
 
