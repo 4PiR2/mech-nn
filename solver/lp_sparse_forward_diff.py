@@ -5,85 +5,57 @@ import numpy as np
 import torch
 
 
-EPS = 1
-
-
 class ODESYSLP:
     def __init__(
             self,
-            bs: int = 1,
+            batch_size: int = 1,
             n_steps: int = 3,
-            n_dim: int = 1,
-            n_iv: int = 2,
-            n_auxiliary: int = 0,
-            n_equations: int = 1,
-            step_size: float = .25,
-            order: int = 2,
+            n_dims: int = 1,
+            ode_order: int = 2,
+            n_init_var_steps: int = 1,
+            n_init_orders: int = 2,
             periodic_boundary: bool = False,
             dtype=torch.float64,
-            n_iv_steps: int = 1,
-            step_list=None,
-            device=None,
+            device: torch.device = None,
     ):
         super().__init__()
-        n_steps: int = n_steps
-        self.step_size: float = step_size
-        self.step_list = torch.full([n_steps - 1], step_size) if step_list is None else step_list
 
         # order is diffeq order. n_order is total number of terms: y'', y', y for order 2.
-        self.n_orders: int = order + 1
-        # number of ode variables
-        # number of auxiliary variables per dim for non-linear terms
-        # dimensions plus n_auxliary vars for each dim
-        n_system_vars: int = n_dim * (1 + n_auxiliary)
-        # batch size
-        batch_size: int = bs
-        self.dtype = dtype
-        device: torch.device = device
+        self.n_orders: int = ode_order + 1
 
         # total number of qp variables
-        num_vars = n_system_vars * n_steps * self.n_orders + 1
+        n_vars = n_dims * n_steps * self.n_orders + 1
+
         # Variables except eps. Used for raveling
-        self.multi_index_shape = (n_steps, n_system_vars, self.n_orders)
+        self.multi_index_shape = (n_steps, n_dims, self.n_orders)
 
-        #### sparse constraint arrays
-        self.equation_constraints = []
-        self.initial_constraints = []
-        self.smooth_constraints = []
-
-        # build skeleton constraints. filled during training
-        # one equation for each dimension
-        self.equation_constraints += [{
-            (step, dim, order): None for dim, order in itertools.product(range(n_system_vars), range(self.n_orders))
-        } for step in range(n_steps)]
-
+        # build skeleton constraints, one equation for each dimension, filled during training
+        equation_constraints = [
+            [(step, dim, order) for dim, order in itertools.product(range(n_dims), range(self.n_orders))]
+            for step in range(n_steps)
+        ]
         constraint_indices = []
-        for i, equation in enumerate(self.equation_constraints):
-            for k, v in equation.items():
+        for i, equation in enumerate(equation_constraints):
+            for k in equation:
                 constraint_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1])
+        self.equation_indices = torch.cat([
+            torch.arange(batch_size).repeat_interleave(len(constraint_indices))[None],
+            torch.cat([torch.tensor(constraint_indices).t()] * batch_size, dim=-1),
+        ], dim=-2)
 
-        eq_A = torch.sparse_coo_tensor(
-            indices=torch.tensor(constraint_indices).t(),
-            values=torch.empty(len(constraint_indices)),
-            size=[len(self.equation_constraints), num_vars],
-            dtype=self.dtype,
-            device=device
-        )
-        self.eq_A = torch.stack([eq_A] * batch_size, dim=0)  # (b, r1, c)
-
-        self.initial_constraints += [{
+        initial_constraints = [{
             (step, dim, order): 1.,
-        } for step, dim, order in itertools.product(range(n_iv_steps), range(n_dim), range(n_iv))]
+        } for step, dim, order in itertools.product(range(n_init_var_steps), range(n_dims), range(n_init_orders))]
 
         if periodic_boundary:
-            self.initial_constraints += [{
+            initial_constraints += [{
                 (0, dim, order): 1.,
                 (n_steps - 1, dim, order): -1.,
-            } for dim, order in itertools.product(range(n_dim), range(self.n_orders - 1))]
+            } for dim, order in itertools.product(range(n_dims), range(self.n_orders - 1))]
 
         constraint_indices = []
         constraint_values = []
-        for i, equation in enumerate(self.initial_constraints):
+        for i, equation in enumerate(initial_constraints):
             for k, v in equation.items():
                 constraint_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1])
                 constraint_values.append(v)
@@ -91,106 +63,86 @@ class ODESYSLP:
         initial_A = torch.sparse_coo_tensor(
             indices=torch.tensor(constraint_indices).t(),
             values=torch.tensor(constraint_values),
-            size=[len(self.initial_constraints), num_vars],
-            dtype=self.dtype,
+            size=[len(initial_constraints), n_vars],
+            dtype=dtype,
             device=device
         )
         self.initial_A = torch.stack([initial_A] * batch_size, dim=0)  # (b, r1, c)
 
+        EPS = 12345
+
         # forward
-        self.smooth_constraints += [{
-            EPS: None,
-            (step + 1, dim, i): None,
-            **{
-                (step, dim, j): None for j in range(i, self.n_orders)
-            }
-        } for step, dim, i in itertools.product(range(n_steps - 1), range(n_system_vars),
-                                                range(self.n_orders - 1))]
+        smooth_constraints = [[
+            EPS,
+            (step + 1, dim, i),
+            *[(step, dim, j) for j in range(i, self.n_orders)]
+        ] for step, dim, i in itertools.product(range(n_steps - 1), range(n_dims), range(self.n_orders - 1))]
         # central
-        self.smooth_constraints += [{
-            EPS: None,
-            (step - 1, dim, self.n_orders - 2): None,
-            (step + 1, dim, self.n_orders - 2): None,
-            (step, dim, self.n_orders - 1): None,
-        } for step, dim in itertools.product(range(1, n_steps - 1), range(n_system_vars))]
+        smooth_constraints += [[
+            EPS,
+            (step - 1, dim, self.n_orders - 2),
+            (step + 1, dim, self.n_orders - 2),
+            (step, dim, self.n_orders - 1),
+        ] for step, dim in itertools.product(range(1, n_steps - 1), range(n_dims))]
 
         # backward
-        self.smooth_constraints += [{
-            EPS: None,
-            (step, dim, i): None,
-            **{
-                (step + 1, dim, j): None for j in range(i, self.n_orders)
-            }
-        } for step, dim, i in itertools.product(range(n_steps - 1), range(n_system_vars),
-                                                range(self.n_orders - 1))]
+        smooth_constraints += [[
+            EPS,
+            (step, dim, i),
+            *[(step + 1, dim, j) for j in range(i, self.n_orders)]
+        ] for step, dim, i in itertools.product(range(n_steps - 1), range(n_dims), range(self.n_orders - 1))]
 
         constraint_indices = []
-        for i, equation in enumerate(self.smooth_constraints):
-            for k, v in equation.items():
+        for i, equation in enumerate(smooth_constraints):
+            for k in equation:
                 constraint_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1] if k != EPS else [i, 0])
 
-        derivative_A = torch.sparse_coo_tensor(
-            indices=torch.tensor(constraint_indices).t(),
-            values=torch.empty(len(constraint_indices)),
-            size=[len(self.smooth_constraints), num_vars],
-            dtype=self.dtype,
-            device=device
-        )
-        self.derivative_A = torch.stack([derivative_A] * batch_size, dim=0)  # (b, r1, c)
-
-    def get_solution_reshaped(self, x):
-        """remove eps and reshape solution"""
-        # x = x[:, 1:].reshape(-1, *self.multi_index_shape)
-        x = x.reshape(-1, *self.multi_index_shape)
-        return x
+        self.smooth_indices = torch.cat([
+            torch.arange(batch_size).repeat_interleave(len(constraint_indices))[None],
+            torch.cat([torch.tensor(constraint_indices).t()] * batch_size, dim=-1),
+        ], dim=-2)
 
     def build_derivative_tensor(self, steps: torch.Tensor):
         sign = 1
 
         # build forward values
-        order_list = []
+        forward_list = []
+        backward_list = []
+        ones = torch.ones_like(steps)
         for i in range(self.n_orders - 1):
-            order_list.append(torch.ones_like(steps))
-            order_list.append(-sign * steps ** i)
+            forward_list.append(ones)
+            backward_list.append(ones)
+            ss = -sign * steps ** i
+            forward_list.append(ss)
+            backward_list.append(ss if i % 2 == 0 else -ss)
             for j in range(i, self.n_orders):
-                order_list.append(sign * steps ** j / math.factorial(j - i))
-        fv = torch.stack(order_list, dim=-1).flatten(start_dim=1)
+                ss = sign * steps ** j / math.factorial(j - i)
+                forward_list.append(ss)
+                backward_list.append(ss if j % 2 == 0 else -ss)
+        fv = torch.stack(forward_list, dim=-1).flatten(start_dim=1)
+        bv = torch.stack(backward_list, dim=-1).flatten(start_dim=1)  # b, n_steps-1, n_system_vars, n_order+2
 
         # build central values
-        # steps shape b,  n_step-1, n_system_vars,
+        # steps shape b, n_step-1, n_system_vars,
         csteps = steps[:, 1:, :]
         psteps = steps[:, :-1, :]
-        sum_inv = 1. / (csteps + psteps)
         ones = torch.ones_like(csteps)
         # scale to make error of order O(h^3) for second order O(h^2) for first order
-        mult = (csteps + psteps) ** (self.n_orders - 2)
+        cpsteps = csteps + psteps
+        mult = cpsteps ** (self.n_orders - 2)
+        sum_inv = cpsteps ** (self.n_orders - 3)
         # shape: b, n_steps-1, 4
-        values = torch.stack([ones, -sum_inv * mult, sum_inv * mult, -mult], dim=-1)
+        values = torch.stack([ones, -sum_inv, sum_inv, -mult], dim=-1)
         # flatten
         # shape, b, n_step-1, n_system_vars, n_order-1, 4
         cv = values.flatten(start_dim=1)
 
-        # build backward values
-        # no reversing
-        order_list = []
-        for i in range(self.n_orders - 1):
-            order_list.append(torch.ones_like(steps))
-            order_list.append(-sign * (-steps) ** i)
-            for j in range(i, self.n_orders):
-                order_list.append(sign * (-steps) ** j / math.factorial(j - i))
-        bv = torch.stack(order_list, dim=-1).flatten(start_dim=1)  # b, n_steps-1, n_system_vars, n_order+2
-
         derivative_values = torch.cat([fv, cv, bv], dim=-1).flatten()
-        derivative_indices = self.derivative_A._indices()
-        derivative_A = torch.sparse_coo_tensor(indices=derivative_indices, values=derivative_values, dtype=self.dtype,
-                                    device=steps.device)
-        return derivative_A
+        return torch.sparse_coo_tensor(
+            indices=self.smooth_indices, values=derivative_values, dtype=steps.dtype, device=steps.device,
+        )
 
-    def build_ode(self, coeffs, eq_rhs, iv_rhs, derivative_A):
+    def build_ode(self, coeffs, derivative_A):
         # shape batch, n_eq, n_step, n_vars, order+1
-        eq_values = coeffs.reshape(-1)
-        eq_indices = self.eq_A._indices()
-        eq_A = torch.sparse_coo_tensor(eq_indices, eq_values, dtype=self.dtype, device=eq_values.device)
-
-        self.AG = torch.cat([eq_A, self.initial_A.type_as(derivative_A), derivative_A], dim=1)
-        self.ub = torch.cat([eq_rhs, iv_rhs], dim=1)
+        eq_A = torch.sparse_coo_tensor(self.equation_indices, coeffs.flatten(), dtype=coeffs.dtype, device=coeffs.device)
+        return torch.cat([eq_A, self.initial_A.to(dtype=coeffs.dtype, device=coeffs.device), derivative_A], dim=-2)
