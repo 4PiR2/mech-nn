@@ -42,9 +42,6 @@ class ODESYSLP:
         self.step_size: float = step_size
         self.step_list = torch.full([n_step - 1], step_size) if step_list is None else step_list
 
-        # initial constraint steps starting from step 0
-        self.num_constraints: int = 0
-
         # tracks number of added constraints
         self.num_added_constraints: int = 0
         self.num_added_equation_constraints: int = 0
@@ -68,6 +65,8 @@ class ODESYSLP:
         self.multi_index_shape = (self.n_step, self.n_system_vars, self.n_order)
 
         #### sparse constraint arrays
+        self.equations = []
+
         # constraint coefficients
         self.value_dict = {ConstraintType.Equation: [], ConstraintType.Initial: [], ConstraintType.Derivative: []}
         # constraint indices
@@ -81,12 +80,13 @@ class ODESYSLP:
 
         # build skeleton constraints. filled during training
         # one equation for each dimension
-        for _ in range(n_equations):
-            for step in range(self.n_step):
-                var_list = list(itertools.product([step], range(self.n_system_vars), range(self.n_order)))
-                val_list = [PH] * len(var_list)
-                self._add_constraint(var_list=var_list, values=val_list, rhs=PH,
-                                     constraint_type=ConstraintType.Equation)
+        self.equations += [{
+            'lhs': {
+                (step, dim, order): PH for dim, order in itertools.product(range(self.n_system_vars), range(self.n_order))
+            },
+            'rhs': PH,
+            'label': 'eq',
+        } for step in range(self.n_step)]
 
         self._build_derivative_constraints()
 
@@ -100,10 +100,18 @@ class ODESYSLP:
                 self._add_constraint(var_list=[(0, dim, order), (self.n_step - 1, dim, order)], values=[1, -1],
                                      rhs=PH, constraint_type=ConstraintType.Initial)
 
+        eq_indices = []
+        eq_values = []
+        for i, equation in enumerate(self.equations):
+            for k, v in equation['lhs'].items():
+                eq_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1])
+                eq_values.append(v)
+        eq_size = len(self.equations)
+
         eq_A = torch.sparse_coo_tensor(
-            indices=torch.tensor([self.row_dict[ConstraintType.Equation], self.col_dict[ConstraintType.Equation]]),
-            values=torch.tensor(self.value_dict[ConstraintType.Equation]),
-            size=[self.num_added_equation_constraints, self.num_vars],
+            indices=torch.tensor(eq_indices).t(),
+            values=torch.tensor(eq_values),
+            size=[eq_size, self.num_vars],
             dtype=self.dtype,
             device=self.device
         )
@@ -129,13 +137,9 @@ class ODESYSLP:
                 dtype=self.dtype,
                 device=self.device,
             )
-            full_A = torch.cat([eq_A, initial_A, derivative_A], dim=0)
             self.initial_A = torch.stack([initial_A] * self.bs, dim=0)  # (b, r2, c)
         else:
-            full_A = torch.cat([eq_A, derivative_A], dim=0)
             self.initial_A = None
-
-        self.num_constraints: int = full_A.size(0)
 
     def get_solution_reshaped(self, x):
         """remove eps and reshape solution"""
@@ -211,26 +215,6 @@ class ODESYSLP:
                 val_list.append(sign * (-self.step_list[step]) ** j / math.factorial(j - i))
             self._add_constraint(var_list=var_list, values=val_list, rhs=0, constraint_type=ConstraintType.Derivative)
 
-    def _get_row_col_sorted_indices(self, row, col):
-        """ Compute indices sorted by row and column and repeats. Useful for sparse outer product when computing constraint derivatives"""
-        indices = torch.tensor(np.stack([row, col], axis=0))
-        row_sorted = indices[:, indices[0, :].argsort()]
-        column_sorted = indices[:, indices[1, :].argsort()]
-        _, row_counts = row_sorted[0].unique_consecutive(return_counts=True)
-        _, column_counts = column_sorted[1].unique_consecutive(return_counts=True)
-        # add batch dimension
-        batch_dim = torch.arange(self.bs).repeat_interleave(repeats=row.shape[0])[None]
-        row_sorted = torch.cat([batch_dim, row_sorted.repeat(1, self.bs)], dim=0)
-        column_sorted = torch.cat([batch_dim, column_sorted.repeat(1, self.bs)], dim=0)
-        return row_sorted, column_sorted, row_counts, column_counts
-
-    def build_equation_tensor(self, eq_values):
-        # shape batch, n_eq, n_step, n_vars, order+1
-        eq_values = eq_values.reshape(-1)
-        eq_indices = self.eq_A._indices()
-        G = torch.sparse_coo_tensor(eq_indices, eq_values, dtype=self.dtype, device=eq_values.device)
-        return G
-
     def build_derivative_tensor(self, steps: torch.Tensor):
         sign = 1
 
@@ -273,16 +257,16 @@ class ODESYSLP:
                                     device=steps.device)
         return G
 
-    def build_ode(self, eq_A, eq_rhs, iv_rhs, derivative_A):
-        if derivative_A is None:
-            derivative_A = self.derivative_A
+    def build_ode(self, coeffs, eq_rhs, iv_rhs, derivative_A):
+        # shape batch, n_eq, n_step, n_vars, order+1
+        eq_values = coeffs.reshape(-1)
+        eq_indices = self.eq_A._indices()
+        eq_A = torch.sparse_coo_tensor(eq_indices, eq_values, dtype=self.dtype, device=eq_values.device)
 
         if self.initial_A is not None:
             self.AG = torch.cat([eq_A, self.initial_A.type_as(derivative_A), derivative_A], dim=1)
         else:
             self.AG = torch.cat([eq_A, derivative_A], dim=1)
-
-        self.num_constraints = self.AG.shape[1]
 
         self.derivative_rhs = self.derivative_rhs.type_as(eq_rhs)
         if self.initial_A is not None:

@@ -54,9 +54,8 @@ class ODEINDLayer(nn.Module):
             steps = steps.double()
 
         derivative_constraints = self.ode.build_derivative_tensor(steps)
-        eq_constraints = self.ode.build_equation_tensor(coeffs)
 
-        self.ode.build_ode(eq_constraints, rhs, iv_rhs, derivative_constraints)
+        self.ode.build_ode(coeffs, rhs, iv_rhs, derivative_constraints)
         A = self.ode.AG.to_dense()
         beta = self.ode.ub.to(dtype=A.dtype)
 
