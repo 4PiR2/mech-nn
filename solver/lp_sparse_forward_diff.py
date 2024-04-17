@@ -1,7 +1,6 @@
-from enum import Enum, IntEnum
+from enum import Enum
 import itertools
 import math
-from typing import Dict, List
 
 import numpy as np
 import torch
@@ -9,15 +8,6 @@ import torch
 
 class VarType(Enum):
     EPS = 1
-
-
-class ConstraintType(Enum):
-    Equation = 1
-    Initial = 10
-    Derivative = 20
-
-
-PH = torch.nan  # placeholder
 
 
 class ODESYSLP:
@@ -42,12 +32,6 @@ class ODESYSLP:
         self.step_size: float = step_size
         self.step_list = torch.full([n_step - 1], step_size) if step_list is None else step_list
 
-        # tracks number of added constraints
-        self.num_added_constraints: int = 0
-        self.num_added_equation_constraints: int = 0
-        self.num_added_initial_constraints: int = 0
-        self.num_added_derivative_constraints: int = 0
-
         # order is diffeq order. n_order is total number of terms: y'', y', y for order 2.
         self.n_order: int = order + 1
         # number of ode variables
@@ -67,17 +51,9 @@ class ODESYSLP:
         #### sparse constraint arrays
         self.equations = []
         self.init_equations = []
+        self.smooth_equations = []
 
-        # constraint coefficients
-        self.value_dict = {ConstraintType.Equation: [], ConstraintType.Initial: [], ConstraintType.Derivative: []}
-        # constraint indices
-        self.row_dict: Dict[ConstraintType, List[int]] = {ConstraintType.Equation: [], ConstraintType.Initial: [],
-                                                          ConstraintType.Derivative: []}
-        # variable indices
-        self.col_dict: Dict[ConstraintType, List[int]] = {ConstraintType.Equation: [], ConstraintType.Initial: [],
-                                                          ConstraintType.Derivative: []}
-        # rhs values
-        self.rhs_dict = {ConstraintType.Equation: [], ConstraintType.Initial: [], ConstraintType.Derivative: []}
+        PH = torch.nan  # placeholder
 
         # build skeleton constraints. filled during training
         # one equation for each dimension
@@ -89,7 +65,46 @@ class ODESYSLP:
             'label': 'eq',
         } for step in range(self.n_step)]
 
-        self._build_derivative_constraints()
+        sign = 1
+
+        self.smooth_equations += [{
+            'lhs': {
+                VarType.EPS: 1.,
+                (step + 1, dim, i): -sign * self.step_list[step] ** i,
+                **{
+                    (step, dim, j): sign * self.step_list[step] ** j / math.factorial(j - i)
+                    for j in range(i, self.n_order)
+                }
+            },
+            'rhs': 0.,
+            'label': 'smf',
+        } for step, dim, i in itertools.product(range(self.n_step - 1), range(self.n_system_vars),
+                                              range(self.n_order - 1))]
+
+        self.smooth_equations += [{
+            'lhs': {
+                VarType.EPS: -1.,
+                (step - 1, dim, self.n_order - 2): -.5 / self.step_size,
+                (step + 1, dim, self.n_order - 2): .5 / self.step_size,
+                (step, dim, self.n_order - 1): -1.,
+            },
+            'rhs': 0.,
+            'label': 'smc',
+        } for step, dim in itertools.product(range(1, self.n_step - 1), range(self.n_system_vars))]
+
+        self.smooth_equations += [{
+            'lhs': {
+                VarType.EPS: 1.,
+                (step, dim, i): -sign * (-self.step_list[step]) ** i,
+                **{
+                    (step + 1, dim, j): sign * (-self.step_list[step]) ** j / math.factorial(j - i)
+                    for j in range(i, self.n_order)
+                }
+            },
+            'rhs': 0.,
+            'label': 'smb',
+        } for step, dim, i in itertools.product(range(self.n_step - 1), range(self.n_system_vars),
+                                              range(self.n_order - 1))]
 
         self.init_equations += [{
             'lhs': {
@@ -143,16 +158,24 @@ class ODESYSLP:
         )
         self.initial_A = torch.stack([initial_A] * self.bs, dim=0)  # (b, r1, c)
 
-        derivative_A = torch.sparse_coo_tensor(
-            indices=torch.tensor([self.row_dict[ConstraintType.Derivative], self.col_dict[ConstraintType.Derivative]]),
-            values=self.value_dict[ConstraintType.Derivative],
-            size=(self.num_added_derivative_constraints, self.num_vars),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.derivative_A = torch.stack([derivative_A] * self.bs, dim=0)  # (b, r3, c)
+        eq_indices = []
+        eq_values = []
+        for i, equation in enumerate(self.smooth_equations):
+            for k, v in equation['lhs'].items():
+                eq_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1] if k != VarType.EPS else [i, 0])
+                eq_values.append(v)
+        eq_size = len(self.smooth_equations)
 
-        self.derivative_rhs = torch.tensor(self.rhs_dict[ConstraintType.Derivative], dtype=self.dtype,
+        derivative_A = torch.sparse_coo_tensor(
+            indices=torch.tensor(eq_indices).t(),
+            values=torch.tensor(eq_values),
+            size=[eq_size, self.num_vars],
+            dtype=self.dtype,
+            device=self.device
+        )
+        self.derivative_A = torch.stack([derivative_A] * self.bs, dim=0)  # (b, r1, c)
+
+        self.derivative_rhs = torch.tensor([equation['rhs'] for equation in self.smooth_equations], dtype=self.dtype,
                                            device=self.device).repeat(self.bs, 1)
 
     def get_solution_reshaped(self, x):
@@ -160,74 +183,6 @@ class ODESYSLP:
         # x = x[:, 1:].reshape(-1, *self.multi_index_shape)
         x = x.reshape(-1, *self.multi_index_shape)
         return x
-
-    def _add_constraint(self, var_list, values, rhs, constraint_type):
-        """ var_list: list of multindex tuples or eps enum """
-        if constraint_type == ConstraintType.Equation:
-            constraint_index = self.num_added_equation_constraints
-        elif constraint_type == ConstraintType.Initial:
-            constraint_index = self.num_added_initial_constraints
-        elif constraint_type == ConstraintType.Derivative:
-            constraint_index = self.num_added_derivative_constraints
-
-        for i, v in enumerate(var_list):
-            if v == VarType.EPS:
-                var_index = 0  # eps has index 0
-            else:
-                # 0 is epsilon, step, grad_index
-                var_index = np.ravel_multi_index(v, self.multi_index_shape, order='C') + 1
-
-            self.col_dict[constraint_type].append(var_index)
-            self.value_dict[constraint_type].append(values[i])
-            self.row_dict[constraint_type].append(constraint_index)
-
-        self.rhs_dict[constraint_type].append(rhs)
-
-        self.num_added_constraints = self.num_added_constraints + 1
-        if constraint_type == ConstraintType.Equation:
-            self.num_added_equation_constraints += 1
-        elif constraint_type == ConstraintType.Initial:
-            self.num_added_initial_constraints += 1
-        elif constraint_type == ConstraintType.Derivative:
-            self.num_added_derivative_constraints += 1
-
-    def _build_derivative_constraints(self):
-        sign = 1
-
-        for step, dim, i in itertools.product(range(self.n_step - 1), range(self.n_system_vars),
-                                              range(self.n_order - 1)):
-            # forward constraints
-            var_list = [VarType.EPS, (step + 1, dim, i)]
-            val_list = [1., -sign * self.step_list[step] ** i]
-            for j in range(i, self.n_order):
-                var_list.append((step, dim, j))
-                val_list.append(sign * self.step_list[step] ** j / math.factorial(j - i))
-            self._add_constraint(var_list=var_list, values=val_list, rhs=0., constraint_type=ConstraintType.Derivative)
-
-        # central constraints
-        # central difference for derivatives
-        for step, dim in itertools.product(range(1, self.n_step - 1), range(self.n_system_vars)):
-            self._add_constraint(
-                var_list=[
-                    VarType.EPS,
-                    (step - 1, dim, self.n_order - 2),
-                    (step + 1, dim, self.n_order - 2),
-                    (step, dim, self.n_order - 1)
-                ],
-                values=[-1., -.5 / self.step_size, .5 / self.step_size, -1.],
-                rhs=0.,
-                constraint_type=ConstraintType.Derivative,
-            )
-
-        for step, dim, i in itertools.product(range(self.n_step - 1), range(self.n_system_vars),
-                                              range(self.n_order - 1)):
-            # backward constraints
-            var_list = [VarType.EPS, (step, dim, i)]
-            val_list = [1., -sign * (-self.step_list[step]) ** i]
-            for j in range(i, self.n_order):
-                var_list.append((step + 1, dim, j))
-                val_list.append(sign * (-self.step_list[step]) ** j / math.factorial(j - i))
-            self._add_constraint(var_list=var_list, values=val_list, rhs=0, constraint_type=ConstraintType.Derivative)
 
     def build_derivative_tensor(self, steps: torch.Tensor):
         sign = 1
