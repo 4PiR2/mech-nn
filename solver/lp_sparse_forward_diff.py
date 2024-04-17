@@ -66,6 +66,7 @@ class ODESYSLP:
 
         #### sparse constraint arrays
         self.equations = []
+        self.init_equations = []
 
         # constraint coefficients
         self.value_dict = {ConstraintType.Equation: [], ConstraintType.Initial: [], ConstraintType.Derivative: []}
@@ -90,15 +91,23 @@ class ODESYSLP:
 
         self._build_derivative_constraints()
 
-        # self._build_initial_constraints()
-        # equation coefficients over grid
-        for step, dim, i in itertools.product(range(n_iv_steps), range(n_dim), range(n_iv)):
-            self._add_constraint(var_list=[(step, dim, i)], values=[1], rhs=PH,
-                                 constraint_type=ConstraintType.Initial)
+        self.init_equations += [{
+            'lhs': {
+                (step, dim, order): 1.,
+            },
+            'rhs': PH,
+            'label': 'in',
+        } for step, dim, order in itertools.product(range(n_iv_steps), range(n_dim), range(n_iv))]
+
         if periodic_boundary:
-            for dim, order in itertools.product(range(n_dim), range(self.n_order - 1)):
-                self._add_constraint(var_list=[(0, dim, order), (self.n_step - 1, dim, order)], values=[1, -1],
-                                     rhs=PH, constraint_type=ConstraintType.Initial)
+            self.init_equations += [{
+                'lhs': {
+                    (0, dim, order): 1.,
+                    (self.n_step - 1, dim, order): -1.,
+                },
+                'rhs': PH,
+                'label': 'in',
+            } for dim, order in itertools.product(range(n_dim), range(self.n_order - 1))]
 
         eq_indices = []
         eq_values = []
@@ -117,6 +126,23 @@ class ODESYSLP:
         )
         self.eq_A = torch.stack([eq_A] * self.bs, dim=0)  # (b, r1, c)
 
+        eq_indices = []
+        eq_values = []
+        for i, equation in enumerate(self.init_equations):
+            for k, v in equation['lhs'].items():
+                eq_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1])
+                eq_values.append(v)
+        eq_size = len(self.init_equations)
+
+        initial_A = torch.sparse_coo_tensor(
+            indices=torch.tensor(eq_indices).t(),
+            values=torch.tensor(eq_values),
+            size=[eq_size, self.num_vars],
+            dtype=self.dtype,
+            device=self.device
+        )
+        self.initial_A = torch.stack([initial_A] * self.bs, dim=0)  # (b, r1, c)
+
         derivative_A = torch.sparse_coo_tensor(
             indices=torch.tensor([self.row_dict[ConstraintType.Derivative], self.col_dict[ConstraintType.Derivative]]),
             values=self.value_dict[ConstraintType.Derivative],
@@ -128,18 +154,6 @@ class ODESYSLP:
 
         self.derivative_rhs = torch.tensor(self.rhs_dict[ConstraintType.Derivative], dtype=self.dtype,
                                            device=self.device).repeat(self.bs, 1)
-
-        if n_iv > 0:
-            initial_A = torch.sparse_coo_tensor(
-                indices=torch.tensor([self.row_dict[ConstraintType.Initial], self.col_dict[ConstraintType.Initial]]),
-                values=self.value_dict[ConstraintType.Initial],
-                size=(self.num_added_initial_constraints, self.num_vars),
-                dtype=self.dtype,
-                device=self.device,
-            )
-            self.initial_A = torch.stack([initial_A] * self.bs, dim=0)  # (b, r2, c)
-        else:
-            self.initial_A = None
 
     def get_solution_reshaped(self, x):
         """remove eps and reshape solution"""
@@ -253,9 +267,9 @@ class ODESYSLP:
 
         derivative_values = torch.cat([fv, cv, bv], dim=-1).flatten()
         derivative_indices = self.derivative_A._indices()
-        G = torch.sparse_coo_tensor(indices=derivative_indices, values=derivative_values, dtype=self.dtype,
+        derivative_A = torch.sparse_coo_tensor(indices=derivative_indices, values=derivative_values, dtype=self.dtype,
                                     device=steps.device)
-        return G
+        return derivative_A
 
     def build_ode(self, coeffs, eq_rhs, iv_rhs, derivative_A):
         # shape batch, n_eq, n_step, n_vars, order+1
@@ -263,13 +277,7 @@ class ODESYSLP:
         eq_indices = self.eq_A._indices()
         eq_A = torch.sparse_coo_tensor(eq_indices, eq_values, dtype=self.dtype, device=eq_values.device)
 
-        if self.initial_A is not None:
-            self.AG = torch.cat([eq_A, self.initial_A.type_as(derivative_A), derivative_A], dim=1)
-        else:
-            self.AG = torch.cat([eq_A, derivative_A], dim=1)
+        self.AG = torch.cat([eq_A, self.initial_A.type_as(derivative_A), derivative_A], dim=1)
 
         self.derivative_rhs = self.derivative_rhs.type_as(eq_rhs)
-        if self.initial_A is not None:
-            self.ub = torch.cat([eq_rhs, iv_rhs, self.derivative_rhs], dim=1)
-        else:
-            self.ub = torch.cat([eq_rhs, self.derivative_rhs], dim=1)
+        self.ub = torch.cat([eq_rhs, iv_rhs, self.derivative_rhs], dim=1)
