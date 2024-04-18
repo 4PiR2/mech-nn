@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class ODEINDLayer(nn.Module):
@@ -54,7 +54,7 @@ class ODEINDLayer(nn.Module):
         # build skeleton constraints, one equation for each dimension, filled during training
         equation_constraints = [
             [(step, dim, order) for dim, order in itertools.product(range(n_dims), range(self.n_orders))]
-            for step in range(n_steps)
+            for step, _ in itertools.product(range(n_steps), range(n_equations))
         ]
         constraint_indices = []
         for i, equation in enumerate(equation_constraints):
@@ -62,7 +62,7 @@ class ODEINDLayer(nn.Module):
                 constraint_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1])
         self.equation_indices = torch.cat([
             torch.arange(batch_size).repeat_interleave(len(constraint_indices))[None],
-            torch.cat([torch.tensor(constraint_indices).t()] * batch_size, dim=-1),
+            torch.tensor(constraint_indices).t().repeat(1, batch_size),
         ], dim=-2)
 
         initial_constraints = [{
@@ -81,7 +81,6 @@ class ODEINDLayer(nn.Module):
             for k, v in equation.items():
                 constraint_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1])
                 constraint_values.append(v)
-
         initial_A = torch.sparse_coo_tensor(
             indices=torch.tensor(constraint_indices).t(),
             values=torch.tensor(constraint_values),
@@ -106,7 +105,6 @@ class ODEINDLayer(nn.Module):
             (step + 1, dim, self.n_orders - 2),
             (step, dim, self.n_orders - 1),
         ] for step, dim in itertools.product(range(1, n_steps - 1), range(n_dims))]
-
         # backward
         smooth_constraints += [[
             EPS,
@@ -118,18 +116,21 @@ class ODEINDLayer(nn.Module):
         for i, equation in enumerate(smooth_constraints):
             for k in equation:
                 constraint_indices.append([i, np.ravel_multi_index(k, self.multi_index_shape, order='C') + 1] if k != EPS else [i, 0])
-
         self.smooth_indices = torch.cat([
             torch.arange(batch_size).repeat_interleave(len(constraint_indices))[None],
-            torch.cat([torch.tensor(constraint_indices).t()] * batch_size, dim=-1),
+            torch.tensor(constraint_indices).t().repeat(1, batch_size),
         ], dim=-2)
 
     def forward(self, coeffs, rhs, iv_rhs, steps):
-        coeffs = coeffs.reshape(self.batch_size, self.n_steps, self.n_dims, self.n_orders)
+        """
+        coeffs: (..., n_steps, n_equations, n_dims, n_orders)
+        rhs: (..., n_steps, n_equations)
+        iv_rhs: (..., n_init_var_steps, n_dims, n_init_var_orders)
+        steps: (..., n_steps-1, n_dims)
+        """
 
         rhs = rhs.reshape(self.batch_size, self.n_steps)
-        if iv_rhs is not None:
-            iv_rhs = iv_rhs.reshape(self.batch_size, self.n_init_var_steps * self.n_init_orders)
+        iv_rhs = iv_rhs.reshape(self.batch_size, self.n_init_var_steps * self.n_init_orders)
 
         steps = steps.reshape(self.batch_size, self.n_steps-1, self.n_dims)
 
@@ -160,15 +161,8 @@ class ODEINDLayer(nn.Module):
         x = rhs1.cholesky_solve(L, upper=False)[..., 0]
 
         # shape: batch, step, vars (== 1), order
-        n_ind_dim = 3
-        u = x.reshape(self.batch_size // n_ind_dim, n_ind_dim, self.n_steps, self.n_orders)
-
-        u0 = u[..., 0]
-        u1 = u[..., 1]
-        u2 = u[..., 2]
-        eps = torch.zeros_like(x[:, 0])
-
-        return u0, u1, u2, eps, steps
+        u = x.reshape(self.batch_size, self.n_steps, self.n_dims, self.n_orders)
+        return u
 
     def build_derivative_tensor(self, steps: torch.Tensor):
         sign = 1
@@ -188,10 +182,10 @@ class ODEINDLayer(nn.Module):
                 forward_list.append(ss)
                 backward_list.append(ss if j % 2 == 0 else -ss)
         fv = torch.stack(forward_list, dim=-1).flatten(start_dim=1)
-        bv = torch.stack(backward_list, dim=-1).flatten(start_dim=1)  # b, n_steps-1, n_system_vars, n_order+2
+        bv = torch.stack(backward_list, dim=-1).flatten(start_dim=1)
 
         # build central values
-        # steps shape b, n_step-1, n_system_vars,
+        # steps shape b, n_step-2, n_system_vars
         csteps = steps[:, 1:, :]
         psteps = steps[:, :-1, :]
         ones = torch.ones_like(csteps)
@@ -201,7 +195,6 @@ class ODEINDLayer(nn.Module):
         sum_inv = cpsteps ** (self.n_orders - 3)
         # shape: b, n_steps-1, 4
         values = torch.stack([ones, -sum_inv, sum_inv, -mult], dim=-1)
-        # flatten
         # shape, b, n_step-1, n_system_vars, n_order-1, 4
         cv = values.flatten(start_dim=1)
 

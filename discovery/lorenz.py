@@ -126,20 +126,22 @@ class Model(nn.Module):
 
         rhs = var_basis @ xi  # (bs, 50, 3)
         rhs = rhs.permute(0, 2, 1)    # (bs, 3, 50)
+        rhs = rhs.reshape(-1, 1, self.n_step_per_batch)
 
         z = torch.zeros(1, self.n_ind_dim, 1, 1).type_as(net_iv)
         o = torch.ones(1, self.n_ind_dim, 1, 1).type_as(net_iv)
 
         coeffs = torch.cat([z, o, z], dim=-1)  # (1, 3, 1, 3)
         coeffs = coeffs.repeat(self.bs, 1, self.n_step_per_batch, 1)  # (bs, 3, 50, 3)
+        coeffs = coeffs.reshape(-1, self.n_step_per_batch, 1, 1, 3)
 
         steps = self.step_size.type_as(net_iv).repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1)
 
-        x0, x1, x2, eps, steps = self.ode(coeffs, rhs, var[:, 0], steps)
+        u = self.ode(coeffs, rhs, var[:, None, None, 0, :], steps)
 
-        x0 = x0.permute(0, 2, 1)
+        x0 = u.reshape(self.bs, 3, self.n_step_per_batch, 3)[..., 0].permute(0, 2, 1)
 
-        return x0, steps, eps, var, _xi
+        return x0, steps, torch.zeros(1), var, _xi
 
 
 def print_eq(model, basis_vars, L, stdout=False):
