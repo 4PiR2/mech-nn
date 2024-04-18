@@ -70,7 +70,7 @@ class Model(nn.Module):
         self.mask = torch.ones_like(self.init_xi, device=device)
 
         # Step size is fixed. Make this a parameter for learned step
-        self.step_size = logit(1e-2) * torch.ones(1, 1, 1)  # [[[-4.5951]]]
+        self.step_size = 1e-2 * torch.ones(1, 1, 1)  # [[[-4.5951]]]
         self.xi = nn.Parameter(self.init_xi)
         self.param_in = nn.Parameter(torch.randn(1, 64))
 
@@ -133,7 +133,7 @@ class Model(nn.Module):
         coeffs = torch.cat([z, o, z], dim=-1)  # (1, 3, 1, 3)
         coeffs = coeffs.repeat(self.bs, 1, self.n_step_per_batch, 1)  # (bs, 3, 50, 3)
 
-        steps = self.step_size.type_as(net_iv).sigmoid().repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1)
+        steps = self.step_size.type_as(net_iv).repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1)
 
         x0, x1, x2, eps, steps = self.ode(coeffs, rhs, var[:, 0], steps)
 
