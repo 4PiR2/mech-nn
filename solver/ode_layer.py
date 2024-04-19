@@ -129,21 +129,45 @@ class ODEINDLayer(nn.Module):
         steps: (..., n_steps-1, n_dims)
         """
 
-        rhs = rhs.reshape(self.batch_size, self.n_steps)
-        iv_rhs = iv_rhs.reshape(self.batch_size, self.n_init_var_steps * self.n_init_orders)
-
         steps = steps.reshape(self.batch_size, self.n_steps-1, self.n_dims)
 
         # coeffs = torch.ones_like(coeffs)
 
         derivative_constraints = self.build_derivative_tensor(steps)
-        eq_A = torch.sparse_coo_tensor(self.equation_indices, coeffs.flatten(), dtype=coeffs.dtype, device=coeffs.device)
-        A = torch.cat([eq_A, self.initial_A.to(dtype=coeffs.dtype, device=coeffs.device), derivative_constraints], dim=-2).to_dense()
-        beta = torch.cat([rhs, iv_rhs], dim=1).to(dtype=A.dtype)
 
-        A = A[..., 1:]
-        At = A.transpose(-2, -1)
-        AtA = At @ A
+        Ae = coeffs.flatten(start_dim=-2)  # (..., n_steps, n_equations, n_dims * n_orders)
+        Aet = Ae.transpose(-2, -1)  # (..., n_steps, n_dims * n_orders, n_equations)
+        Aet_Ae = Aet @ Ae  # (..., n_steps, n_dims * n_orders, n_dims * n_orders)
+        Aet_be = (Aet @ rhs[..., None])[..., 0]  # (..., n_steps, n_dims * n_orders)
+
+        init_idx = torch.arange(self.n_init_orders).repeat(self.n_dims) + torch.arange(self.n_dims).repeat_interleave(self.n_init_orders) * self.n_orders
+        Aet_Ae[..., :self.n_init_var_steps, init_idx, init_idx] += 1.
+        bi = torch.cat([iv_rhs, torch.zeros(*iv_rhs.shape[:-1], self.n_orders - iv_rhs.size(-1), dtype=iv_rhs.dtype, device=iv_rhs.device)], dim=-1)
+        Aet_be[..., :self.n_init_var_steps, :] += bi.flatten(start_dim=-2)
+
+        ord_idx = torch.arange(self.n_orders, device=steps.device)
+        sp = (-steps)[..., None] ** ord_idx  # (..., n_steps-1, n_dims, n_orders)
+        u = sp[..., None, :] / (ord_idx - ord_idx[..., None] + 1).triu()[:-1].lgamma().exp()  # (..., n_steps-1, n_dims, n_orders-1, n_orders)
+        d = -sp[..., :-1]  # (..., n_steps-1, n_dims, n_order-1)
+        ut_u = u.transpose(-2, -1) @ u  # (..., n_steps-1, n_dims, n_orders, n_orders)
+        dt_u = d[..., None] * u
+        dt_d = (d * d)[:, :-1]
+
+        Aet_Ae_dense = torch.zeros(*Aet_Ae.shape[:-3], self.n_steps * self.n_dims * self.n_orders, self.n_steps * self.n_dims * self.n_orders, dtype=Aet_Ae.dtype, device=Aet_Ae.device)
+        for step in range(self.n_steps):
+            Aet_Ae_dense[..., step * self.n_dims * self.n_orders: (step+1) * self.n_dims * self.n_orders, step * self.n_dims * self.n_orders: (step+1) * self.n_dims * self.n_orders] = Aet_Ae[..., step, :, :]
+        Aet_be_dense = Aet_be.flatten(start_dim=-2)  # (..., n_steps * n_dims * n_orders)
+
+        Ast_As_dense = torch.zeros_like(Aet_Ae_dense)
+        for step in range(self.n_steps-1):
+            Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, step * self.n_orders: (step+1) * self.n_orders] += ut_u[..., step, 0, :, :].abs()
+            diag_idx = torch.arange((step+1) * self.n_orders, (step+2) * self.n_orders-1)
+            Ast_As_dense[..., diag_idx, diag_idx] += dt_d[..., step, 0, :, :]
+            Ast_As_dense[..., (step+1) * self.n_orders: (step+2) * self.n_orders-1, step * self.n_orders: (step+1) * self.n_orders] -= dt_u[..., step, 0, :, :].abs()
+            Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, (step+1) * self.n_orders: (step+2) * self.n_orders-1] -= dt_u[..., step, 0, :, :].transpose(-2, -1).abs()
+
+        A = derivative_constraints.to_dense()[..., 1:]
+        AtA = A.transpose(-2, -1) @ A + Aet_Ae_dense
         L, info = torch.linalg.cholesky_ex(AtA, upper=False, check_errors=False)
 
         # from PIL import Image
@@ -157,8 +181,7 @@ class ODEINDLayer(nn.Module):
         # save_mat(AtA, 'ata')
         # save_mat(L, 'l')
 
-        rhs1 = At[..., :beta.size(-1)] @ beta[..., None]
-        x = rhs1.cholesky_solve(L, upper=False)[..., 0]
+        x = Aet_be_dense[..., None].cholesky_solve(L, upper=False)[..., 0]
 
         # shape: batch, step, vars (== 1), order
         u = x.reshape(self.batch_size, self.n_steps, self.n_dims, self.n_orders)
