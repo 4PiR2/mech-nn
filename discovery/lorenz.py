@@ -135,7 +135,7 @@ class Model(nn.Module):
         coeffs = coeffs.repeat(self.bs, 1, self.n_step_per_batch, 1)  # (bs, 3, 50, 3)
         coeffs = coeffs.reshape(-1, self.n_step_per_batch, 1, 1, 3)
 
-        steps = self.step_size.type_as(net_iv).repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1)
+        steps = self.step_size.type_as(net_iv).repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1).reshape(-1, self.n_step_per_batch-1)
 
         u = self.ode(coeffs, rhs, var[:, 0, :].reshape(self.bs * self.n_ind_dim, 1, 1, 1), steps)
 

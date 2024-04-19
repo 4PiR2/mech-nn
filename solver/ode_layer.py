@@ -121,29 +121,25 @@ class ODEINDLayer(nn.Module):
             torch.tensor(constraint_indices).t().repeat(1, batch_size),
         ], dim=-2)
 
-    def forward(self, coeffs, rhs, iv_rhs, steps):
+    def forward(self, coefficients, rhs_equation, rhs_init, steps):
         """
-        coeffs: (..., n_steps, n_equations, n_dims, n_orders)
-        rhs: (..., n_steps, n_equations)
-        iv_rhs: (..., n_init_var_steps, n_dims, n_init_var_orders)
+        coefficients: (..., n_steps, n_equations, n_dims, n_orders)
+        rhs_equation: (..., n_steps, n_equations)
+        rhs_init: (..., n_init_var_steps, n_dims, n_init_var_orders)
         steps: (..., n_steps-1)
         """
 
-        steps = steps.reshape(self.batch_size, self.n_steps-1)
+        # coefficients = torch.ones_like(coefficients)
 
-        # coeffs = torch.ones_like(coeffs)
-
-        derivative_constraints = self.build_derivative_tensor(steps.reshape(self.batch_size, self.n_steps-1, 1))
-
-        Ae = coeffs.flatten(start_dim=-2)  # (..., n_steps, n_equations, n_dims * n_orders)
-        Aet = Ae.transpose(-2, -1)  # (..., n_steps, n_dims * n_orders, n_equations)
-        Aet_Ae = Aet @ Ae  # (..., n_steps, n_dims * n_orders, n_dims * n_orders)
-        Aet_be = (Aet @ rhs[..., None])[..., 0]  # (..., n_steps, n_dims * n_orders)
+        c = coefficients.flatten(start_dim=-2)  # (..., n_steps, n_equations, n_dims * n_orders)
+        ct = c.transpose(-2, -1)  # (..., n_steps, n_dims * n_orders, n_equations)
+        ct_c = ct @ c  # (..., n_steps, n_dims * n_orders, n_dims * n_orders)
+        ct_b = (ct @ rhs_equation[..., None])[..., 0]  # (..., n_steps, n_dims * n_orders)
 
         init_idx = torch.arange(self.n_init_orders).repeat(self.n_dims) + torch.arange(self.n_dims).repeat_interleave(self.n_init_orders) * self.n_orders
-        Aet_Ae[..., :self.n_init_var_steps, init_idx, init_idx] += 1.
-        bi = torch.cat([iv_rhs, torch.zeros(*iv_rhs.shape[:-1], self.n_orders - iv_rhs.size(-1), dtype=iv_rhs.dtype, device=iv_rhs.device)], dim=-1)
-        Aet_be[..., :self.n_init_var_steps, :] += bi.flatten(start_dim=-2)
+        ct_c[..., :self.n_init_var_steps, init_idx, init_idx] += 1.
+        bi = torch.cat([rhs_init, torch.zeros(*rhs_init.shape[:-1], self.n_orders - rhs_init.size(-1), dtype=rhs_init.dtype, device=rhs_init.device)], dim=-1)
+        ct_b[..., :self.n_init_var_steps, :] += bi.flatten(start_dim=-2)
 
         order_idx = torch.arange(self.n_orders, device=steps.device)  # (n_orders)
         sign_vec = (-1) ** order_idx  # (n_orders)
@@ -179,10 +175,10 @@ class ODEINDLayer(nn.Module):
         block_lower_off_diag2 = torch.zeros(*block_lower_off_diag.shape[:-3], self.n_steps-2, self.n_orders, self.n_orders, dtype=steps.dtype, device=steps.device)
         block_lower_off_diag2[..., self.n_orders - 2, self.n_orders - 2] -= steps26
 
-        Aet_Ae_dense = torch.zeros(*Aet_Ae.shape[:-3], self.n_steps * self.n_dims * self.n_orders, self.n_steps * self.n_dims * self.n_orders, dtype=Aet_Ae.dtype, device=Aet_Ae.device)
+        Aet_Ae_dense = torch.zeros(*ct_c.shape[:-3], self.n_steps * self.n_dims * self.n_orders, self.n_steps * self.n_dims * self.n_orders, dtype=ct_c.dtype, device=ct_c.device)
         for step in range(self.n_steps):
-            Aet_Ae_dense[..., step * self.n_dims * self.n_orders: (step+1) * self.n_dims * self.n_orders, step * self.n_dims * self.n_orders: (step+1) * self.n_dims * self.n_orders] = Aet_Ae[..., step, :, :]
-        Aet_be_dense = Aet_be.flatten(start_dim=-2)  # (..., n_steps * n_dims * n_orders)
+            Aet_Ae_dense[..., step * self.n_dims * self.n_orders: (step+1) * self.n_dims * self.n_orders, step * self.n_dims * self.n_orders: (step+1) * self.n_dims * self.n_orders] = ct_c[..., step, :, :]
+        Aet_be_dense = ct_b.flatten(start_dim=-2)  # (..., n_steps * n_dims * n_orders)
 
         Ast_As_dense = torch.zeros_like(Aet_Ae_dense)
         for step in range(self.n_steps):
@@ -194,11 +190,7 @@ class ODEINDLayer(nn.Module):
             Ast_As_dense[..., (step+2) * self.n_orders: (step+3) * self.n_orders, step * self.n_orders: (step+1) * self.n_orders] = block_lower_off_diag2[..., step, :, :]
             Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, (step+2) * self.n_orders: (step+3) * self.n_orders] = block_lower_off_diag2[..., step, :, :].transpose(-2, -1)
 
-        A = derivative_constraints.to_dense()[..., 1:]
-        AtA = A.transpose(-2, -1) @ A
-
-        diff = (AtA - Ast_As_dense).abs().max().item()
-        print(diff)
+        AtA = Aet_Ae_dense + Ast_As_dense  # TODO: n_dims
 
         L, info = torch.linalg.cholesky_ex(AtA, upper=False, check_errors=False)
 
