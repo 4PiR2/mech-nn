@@ -126,14 +126,14 @@ class ODEINDLayer(nn.Module):
         coeffs: (..., n_steps, n_equations, n_dims, n_orders)
         rhs: (..., n_steps, n_equations)
         iv_rhs: (..., n_init_var_steps, n_dims, n_init_var_orders)
-        steps: (..., n_steps-1, n_dims)
+        steps: (..., n_steps-1)
         """
 
-        steps = steps.reshape(self.batch_size, self.n_steps-1, self.n_dims)
+        steps = steps.reshape(self.batch_size, self.n_steps-1)
 
         # coeffs = torch.ones_like(coeffs)
 
-        derivative_constraints = self.build_derivative_tensor(steps)
+        derivative_constraints = self.build_derivative_tensor(steps.reshape(self.batch_size, self.n_steps-1, 1))
 
         Ae = coeffs.flatten(start_dim=-2)  # (..., n_steps, n_equations, n_dims * n_orders)
         Aet = Ae.transpose(-2, -1)  # (..., n_steps, n_dims * n_orders, n_equations)
@@ -145,13 +145,26 @@ class ODEINDLayer(nn.Module):
         bi = torch.cat([iv_rhs, torch.zeros(*iv_rhs.shape[:-1], self.n_orders - iv_rhs.size(-1), dtype=iv_rhs.dtype, device=iv_rhs.device)], dim=-1)
         Aet_be[..., :self.n_init_var_steps, :] += bi.flatten(start_dim=-2)
 
-        ord_idx = torch.arange(self.n_orders, device=steps.device)
-        sp = (-steps)[..., None] ** ord_idx  # (..., n_steps-1, n_dims, n_orders)
-        u = sp[..., None, :] / (ord_idx - ord_idx[..., None] + 1).triu()[:-1].lgamma().exp()  # (..., n_steps-1, n_dims, n_orders-1, n_orders)
-        d = -sp[..., :-1]  # (..., n_steps-1, n_dims, n_order-1)
-        ut_u = u.transpose(-2, -1) @ u  # (..., n_steps-1, n_dims, n_orders, n_orders)
-        dt_u = d[..., None] * u
-        dt_d = (d * d)[:, :-1]
+        order_idx = torch.arange(self.n_orders, device=steps.device)  # (n_orders)
+        sign_vec = (-1) ** order_idx  # (n_orders)
+        sign_map = sign_vec * sign_vec[:, None]  # (n_orders, n_orders)
+
+        expansions = steps[..., None] ** order_idx  # (..., n_steps-1, n_orders)
+        et_e_diag = expansions ** 2  # (..., n_steps-1, n_orders)
+        et_e_diag[..., -1] = 0.
+
+        factorials = (-(order_idx - order_idx[:, None] + 1).triu().lgamma()).exp()  # (n_orders, n_orders)
+        factorials[-1, -1] = 0.
+        e_outer = expansions[..., None] * expansions[..., None, :]  # (..., n_steps-1, n_orders, n_orders)
+        et_f_e = factorials * e_outer  # (..., n_steps-1, n_orders, n_orders)
+        et_ft_f_e = (factorials.t() @ factorials) * e_outer  # (..., n_steps-1, n_orders, n_orders)
+
+        block_lower_off_diag = - et_f_e - (et_f_e * sign_map).transpose(-2, -1)  # (..., n_steps-1, n_orders, n_orders)
+        block_diag = torch.zeros(*block_lower_off_diag.shape[:-3], self.n_steps, self.n_orders, self.n_orders, dtype=steps.dtype, device=steps.device)
+        block_diag[..., :-1, :, :] += et_ft_f_e
+        block_diag[..., 1:, :, :] += et_ft_f_e * sign_map
+        block_diag[..., :-1, order_idx, order_idx] += et_e_diag
+        block_diag[..., 1:, order_idx, order_idx] += et_e_diag
 
         Aet_Ae_dense = torch.zeros(*Aet_Ae.shape[:-3], self.n_steps * self.n_dims * self.n_orders, self.n_steps * self.n_dims * self.n_orders, dtype=Aet_Ae.dtype, device=Aet_Ae.device)
         for step in range(self.n_steps):
@@ -159,12 +172,11 @@ class ODEINDLayer(nn.Module):
         Aet_be_dense = Aet_be.flatten(start_dim=-2)  # (..., n_steps * n_dims * n_orders)
 
         Ast_As_dense = torch.zeros_like(Aet_Ae_dense)
+        for step in range(self.n_steps):
+            Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, step * self.n_orders: (step+1) * self.n_orders] = block_diag[..., step, :, :]
         for step in range(self.n_steps-1):
-            Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, step * self.n_orders: (step+1) * self.n_orders] += ut_u[..., step, 0, :, :].abs()
-            diag_idx = torch.arange((step+1) * self.n_orders, (step+2) * self.n_orders-1)
-            Ast_As_dense[..., diag_idx, diag_idx] += dt_d[..., step, 0, :, :]
-            Ast_As_dense[..., (step+1) * self.n_orders: (step+2) * self.n_orders-1, step * self.n_orders: (step+1) * self.n_orders] -= dt_u[..., step, 0, :, :].abs()
-            Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, (step+1) * self.n_orders: (step+2) * self.n_orders-1] -= dt_u[..., step, 0, :, :].transpose(-2, -1).abs()
+            Ast_As_dense[..., (step+1) * self.n_orders: (step+2) * self.n_orders, step * self.n_orders: (step+1) * self.n_orders] = block_lower_off_diag[..., step, :, :]
+            Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, (step+1) * self.n_orders: (step+2) * self.n_orders] = block_lower_off_diag[..., step, :, :].transpose(-2, -1)
 
         A = derivative_constraints.to_dense()[..., 1:]
         AtA = A.transpose(-2, -1) @ A + Aet_Ae_dense
