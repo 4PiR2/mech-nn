@@ -156,15 +156,28 @@ class ODEINDLayer(nn.Module):
         factorials = (-(order_idx - order_idx[:, None] + 1).triu().lgamma()).exp()  # (n_orders, n_orders)
         factorials[-1, -1] = 0.
         e_outer = expansions[..., None] * expansions[..., None, :]  # (..., n_steps-1, n_orders, n_orders)
-        et_f_e = factorials * e_outer  # (..., n_steps-1, n_orders, n_orders)
-        et_ft_f_e = (factorials.t() @ factorials) * e_outer  # (..., n_steps-1, n_orders, n_orders)
+        et_ft_f_e = e_outer * (factorials.t() @ factorials)  # (..., n_steps-1, n_orders, n_orders)
 
-        block_lower_off_diag = - et_f_e - (et_f_e * sign_map).transpose(-2, -1)  # (..., n_steps-1, n_orders, n_orders)
+        block_lower_off_diag = e_outer * -(factorials + factorials.transpose(-2, -1) * sign_map)  # (..., n_steps-1, n_orders, n_orders)
         block_diag = torch.zeros(*block_lower_off_diag.shape[:-3], self.n_steps, self.n_orders, self.n_orders, dtype=steps.dtype, device=steps.device)
         block_diag[..., :-1, :, :] += et_ft_f_e
         block_diag[..., 1:, :, :] += et_ft_f_e * sign_map
         block_diag[..., :-1, order_idx, order_idx] += et_e_diag
         block_diag[..., 1:, order_idx, order_idx] += et_e_diag
+
+        steps2 = steps[..., :-1] + steps[..., 1:]  # (..., n_steps-2)
+        steps26 = steps2 ** (self.n_orders * 2 - 6)  # (..., n_steps-2)
+        steps25 = steps2 ** (self.n_orders * 2 - 5)  # (..., n_steps-2)
+        steps24 = steps2 ** (self.n_orders * 2 - 4)  # (..., n_steps-2)
+
+        block_diag[..., :-2, self.n_orders - 2, self.n_orders - 2] += steps26
+        block_diag[..., 2:, self.n_orders - 2, self.n_orders - 2] += steps26
+        block_diag[..., 1:-1, self.n_orders - 1, self.n_orders - 1] += steps24
+        block_lower_off_diag[..., :-1, self.n_orders - 1, self.n_orders - 2] += steps25
+        block_lower_off_diag[..., 1:, self.n_orders - 2, self.n_orders - 1] -= steps25
+
+        block_lower_off_diag2 = torch.zeros(*block_lower_off_diag.shape[:-3], self.n_steps-2, self.n_orders, self.n_orders, dtype=steps.dtype, device=steps.device)
+        block_lower_off_diag2[..., self.n_orders - 2, self.n_orders - 2] -= steps26
 
         Aet_Ae_dense = torch.zeros(*Aet_Ae.shape[:-3], self.n_steps * self.n_dims * self.n_orders, self.n_steps * self.n_dims * self.n_orders, dtype=Aet_Ae.dtype, device=Aet_Ae.device)
         for step in range(self.n_steps):
@@ -177,9 +190,16 @@ class ODEINDLayer(nn.Module):
         for step in range(self.n_steps-1):
             Ast_As_dense[..., (step+1) * self.n_orders: (step+2) * self.n_orders, step * self.n_orders: (step+1) * self.n_orders] = block_lower_off_diag[..., step, :, :]
             Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, (step+1) * self.n_orders: (step+2) * self.n_orders] = block_lower_off_diag[..., step, :, :].transpose(-2, -1)
+        for step in range(self.n_steps-2):
+            Ast_As_dense[..., (step+2) * self.n_orders: (step+3) * self.n_orders, step * self.n_orders: (step+1) * self.n_orders] = block_lower_off_diag2[..., step, :, :]
+            Ast_As_dense[..., step * self.n_orders: (step+1) * self.n_orders, (step+2) * self.n_orders: (step+3) * self.n_orders] = block_lower_off_diag2[..., step, :, :].transpose(-2, -1)
 
         A = derivative_constraints.to_dense()[..., 1:]
-        AtA = A.transpose(-2, -1) @ A + Aet_Ae_dense
+        AtA = A.transpose(-2, -1) @ A
+
+        diff = (AtA - Ast_As_dense).abs().max().item()
+        print(diff)
+
         L, info = torch.linalg.cholesky_ex(AtA, upper=False, check_errors=False)
 
         # from PIL import Image
@@ -187,10 +207,11 @@ class ODEINDLayer(nn.Module):
         # def save_mat(matrix, fname):
         #     matrix = matrix[0].bool().detach().cpu().to(dtype=torch.uint8).numpy() * 255
         #     image = Image.fromarray(matrix)  # 'L' mode for grayscale
-        #     image.save(f'logs/img/1p/{fname}.png')
+        #     image.save(f'logs/img/2/{fname}.png')
         #
         # save_mat(A, 'a')
         # save_mat(AtA, 'ata')
+        # save_mat(Ast_As_dense, 'ata2')
         # save_mat(L, 'l')
 
         x = Aet_be_dense[..., None].cholesky_solve(L, upper=False)[..., 0]
