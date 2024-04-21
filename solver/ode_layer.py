@@ -41,7 +41,7 @@ class ODEINDLayer(nn.Module):
         dtype = coefficients.dtype
         device: torch.device = coefficients.device
 
-        *_, n_steps, n_equations, n_dims, n_orders = coefficients.shape
+        *batches, n_steps, n_equations, n_dims, n_orders = coefficients.shape
         *_, n_init_var_steps, _, n_init_var_orders = rhs_init.shape
         assert n_steps, n_equations == rhs_equation.shape[-2:]
         assert n_dims == rhs_init.shape[-2]
@@ -77,7 +77,7 @@ class ODEINDLayer(nn.Module):
         et_ft_f_e = e_outer * (factorials.t() @ factorials)  # (..., n_steps-1, n_orders, n_orders)
 
         smooth_block_diag_1 = e_outer * -(factorials + factorials.transpose(-2, -1) * sign_map)  # (..., n_steps-1, n_orders, n_orders)
-        smooth_block_diag_0 = torch.zeros(*smooth_block_diag_1.shape[:-3], n_steps, n_orders, n_orders, dtype=dtype, device=device)  # (..., n_steps, n_orders, n_orders)
+        smooth_block_diag_0 = torch.zeros(*batches, n_steps, n_orders, n_orders, dtype=dtype, device=device)  # (..., n_steps, n_orders, n_orders)
         smooth_block_diag_0[..., :-1, :, :] += et_ft_f_e
         smooth_block_diag_0[..., 1:, :, :] += et_ft_f_e * sign_map
         smooth_block_diag_0[..., :-1, order_idx, order_idx] += et_e_diag
@@ -94,25 +94,56 @@ class ODEINDLayer(nn.Module):
         smooth_block_diag_0[..., 1:-1, n_orders - 1, n_orders - 1] += steps24
         smooth_block_diag_1[..., :-1, n_orders - 1, n_orders - 2] += steps25
         smooth_block_diag_1[..., 1:, n_orders - 2, n_orders - 1] -= steps25
-        smooth_block_diag_2 = torch.zeros(*smooth_block_diag_1.shape[:-3], n_steps - 2, n_orders, n_orders, dtype=dtype, device=device)  # (..., n_steps-2, n_orders, n_orders)
+        smooth_block_diag_2 = torch.zeros(*batches, n_steps - 2, n_orders, n_orders, dtype=dtype, device=device)  # (..., n_steps-2, n_orders, n_orders)
         smooth_block_diag_2[..., n_orders - 2, n_orders - 2] = -steps26
 
+        # copy to n_dims
+        block_diag_1 = torch.zeros(*batches, n_steps - 1, n_dims * n_orders, n_dims * n_orders, dtype=dtype, device=device)  # (..., n_steps-1, n_dims * n_orders, n_dims * n_orders)
+        block_diag_2 = torch.zeros(*batches, n_steps - 2, n_dims * n_orders, n_dims * n_orders, dtype=dtype, device=device)  # (..., n_steps-2, n_dims * n_orders, n_dims * n_orders)
         for dim in range(n_dims):
-            block_diag_0[..., dim * n_orders: (dim + 1) * n_orders, dim * n_orders: (dim + 1) * n_orders] += smooth_block_diag_0
+            i1 = dim * n_orders
+            i2 = (dim + 1) * n_orders
+            block_diag_0[..., i1:i2, i1:i2] += smooth_block_diag_0
+            block_diag_1[..., i1:i2, i1:i2] = smooth_block_diag_1
+            block_diag_2[..., i1:i2, i1:i2] = smooth_block_diag_2
 
-        AtA = torch.zeros(*block_diag_0.shape[:-3], n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+        # in-place blocked cholesky decomposition
         for step in range(n_steps):
-            AtA[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
-        # TODO: n_dims
-        for step in range(n_steps-1):
-            AtA[..., (step+1) * n_orders: (step+2) * n_orders, step * n_orders: (step+1) * n_orders] = smooth_block_diag_1[..., step, :, :]
-            AtA[..., step * n_orders: (step+1) * n_orders, (step+1) * n_orders: (step+2) * n_orders] = smooth_block_diag_1[..., step, :, :].transpose(-2, -1)
-        for step in range(n_steps-2):
-            AtA[..., (step+2) * n_orders: (step+3) * n_orders, step * n_orders: (step+1) * n_orders] = smooth_block_diag_2[..., step, :, :]
-            AtA[..., step * n_orders: (step+1) * n_orders, (step+2) * n_orders: (step+3) * n_orders] = smooth_block_diag_2[..., step, :, :]
+            if step >= 2:
+                torch.linalg.solve_triangular(
+                    block_diag_0[..., step - 2, :, :].transpose(-2, -1),
+                    block_diag_2[..., step - 2, :, :],
+                    upper=True,
+                    left=False,
+                    out=block_diag_2[..., step - 2, :, :],
+                )
+                block_diag_1[..., step - 1, :, :] -= block_diag_2[..., step - 2, :, :] @ block_diag_1[..., step - 2, :, :].transpose(-2, -1)
+            if step >= 1:
+                torch.linalg.solve_triangular(
+                    block_diag_0[..., step - 1, :, :].transpose(-2, -1),
+                    block_diag_1[..., step - 1, :, :],
+                    upper=True,
+                    left=False,
+                    out=block_diag_1[..., step - 1, :, :],
+                )
+                if step >= 2:
+                    block_diag_0[..., step, :, :] -= block_diag_2[..., step - 2, :, :] @ block_diag_2[..., step - 2, :, :].transpose(-2, -1)
+                block_diag_0[..., step, :, :] -= block_diag_1[..., step - 1, :, :] @ block_diag_1[..., step - 1, :, :].transpose(-2, -1)
+            torch.linalg.cholesky_ex(
+                block_diag_0[..., step, :, :],
+                upper=False,
+                check_errors=False,
+                out=(block_diag_0[..., step, :, :], torch.empty(*batches, dtype=torch.int, device=device)),
+            )
 
-        L, info = torch.linalg.cholesky_ex(AtA, upper=False, check_errors=False)
+        L = torch.zeros(*batches, n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+        for step in range(n_steps):
+            L[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
+        for step in range(n_steps-1):
+            L[..., (step+1) * n_orders: (step+2) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_1[..., step, :, :]
+        for step in range(n_steps-2):
+            L[..., (step+2) * n_orders: (step+3) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_2[..., step, :, :]
 
         x = beta.flatten(start_dim=-3, end_dim=-2).cholesky_solve(L, upper=False)  # (..., n_steps * n_dims * n_orders, 1)
-        x = x.reshape(*x.shape[:-2], n_steps, n_dims, n_orders)
+        x = x.reshape(*batches, n_steps, n_dims, n_orders)
         return x
