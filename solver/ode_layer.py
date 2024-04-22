@@ -110,46 +110,48 @@ def ode_forward(
             check_errors=False,
         )
 
-    # L = torch.zeros(*batches, n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
-    # for step in range(n_steps):
-    #     L[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
-    # for step in range(n_steps-1):
-    #     L[..., (step+1) * n_orders: (step+2) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_1[..., step, :, :]
-    # for step in range(n_steps-2):
-    #     L[..., (step+2) * n_orders: (step+3) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_2[..., step, :, :]
+    L = torch.zeros(*batches, n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+    for step in range(n_steps):
+        L[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
+    for step in range(n_steps-1):
+        L[..., (step+1) * n_dims * n_orders: (step+2) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_1[..., step, :, :]
+    for step in range(n_steps-2):
+        L[..., (step+2) * n_dims * n_orders: (step+3) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_2[..., step, :, :]
 
-    # x0 = beta.flatten(start_dim=-3, end_dim=-2).cholesky_solve(L, upper=False)  # (..., n_steps * n_dims * n_orders, 1)
-    # y = torch.linalg.solve_triangular(L, beta.flatten(start_dim=-3, end_dim=-2), upper=False, left=True)
-    # x0 = torch.linalg.solve_triangular(L.transpose(-2, -1), y, upper=True, left=True)
+    x0 = beta.flatten(start_dim=-3, end_dim=-2).cholesky_solve(L, upper=False)  # (..., n_steps * n_dims * n_orders, 1)
+    y1 = torch.linalg.solve_triangular(L, beta.flatten(start_dim=-3, end_dim=-2), upper=False, left=True)
+    x1 = torch.linalg.solve_triangular(L.transpose(-2, -1), y1, upper=True, left=True)
 
     # A X = B => L (Lt X) = B
-    # solve L Y = B, in-place block forward substitution
+    # solve L Y = B, block forward substitution
+    y_list: list[torch.Tensor | None] = [None] * n_steps
     for step in range(n_steps):
-        beta[..., step, :, :] = torch.linalg.solve_triangular(block_diag_0[..., step, :, :], beta[..., step, :, :], upper=False, left=True)
-        # function with "out=" does not support auto-diff
-        if step < n_steps - 1:
-            beta[..., step + 1, :, :] -= block_diag_1[..., step, :, :] @ beta[..., step, :, :]
-        if step < n_steps - 2:
-            beta[..., step + 2, :, :] -= block_diag_2[..., step, :, :] @ beta[..., step, :, :]
+        b_step = beta[..., step, :, :]
+        if step >= 2:
+            b_step = b_step - block_diag_2[..., step - 2, :, :] @ y_list[step - 2]
+        if step >= 1:
+            b_step = b_step - block_diag_1[..., step - 1, :, :] @ y_list[step - 1]
+        y_list[step] = torch.linalg.solve_triangular(block_diag_0[..., step, :, :], b_step, upper=False, left=True)
 
     block_diag_0 = block_diag_0.transpose(-2, -1)
     block_diag_1 = block_diag_1.transpose(-2, -1)
     block_diag_2 = block_diag_2.transpose(-2, -1)
 
-    # solve Lt X = Y, in-place block backward substitution
+    # solve Lt X = Y, block backward substitution
+    x_list: list[torch.Tensor | None] = [None] * n_steps
     for step in range(n_steps - 1, -1, -1):
-        beta[..., step, :, :] = torch.linalg.solve_triangular(block_diag_0[..., step, :, :], beta[..., step, :, :], upper=True, left=True)
-        if step >= 1:
-            beta[..., step - 1, :, :] -= block_diag_1[..., step - 1, :, :] @ beta[..., step, :, :]
-        if step >= 2:
-            beta[..., step - 2, :, :] -= block_diag_2[..., step - 2, :, :] @ beta[..., step, :, :]
-
-    u = beta.reshape(*batches, n_steps, n_dims, n_orders)
+        y_step = y_list[step]
+        if step < n_steps - 2:
+            y_step = y_step - block_diag_2[..., step, :, :] @ x_list[step + 2]
+        if step < n_steps - 1:
+            y_step = y_step - block_diag_1[..., step, :, :] @ x_list[step + 1]
+        x_list[step] = torch.linalg.solve_triangular(block_diag_0[..., step, :, :], y_step, upper=True, left=True)
+    u = torch.stack(x_list, dim=-3).reshape(*batches, n_steps, n_dims, n_orders)
     return u
 
 
 def test():
-    torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(mode=True, check_nan=True)
     dtype = torch.float64
     device = torch.device('cuda:0')
     batches = (11,)
