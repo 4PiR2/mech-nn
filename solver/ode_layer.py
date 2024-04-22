@@ -6,29 +6,52 @@ def ode_forward(
         rhs_equation: torch.Tensor,
         rhs_init: torch.Tensor,
         steps: torch.Tensor,
+        n_steps: int = None,
+        n_init_var_steps: int = None,
 ) -> torch.Tensor:
     """
-    coefficients: (..., n_steps, n_equations, n_dims, n_orders)
-    rhs_equation: (..., n_steps, n_equations)
-    rhs_init: (..., n_init_var_steps, n_dims, n_init_var_orders)
-    steps: (..., n_steps-1)
+    coefficients: (..., n_steps[b], n_equations, n_dims, n_orders)
+    rhs_equation: (..., n_steps[b], n_equations[e])
+    rhs_init: (..., n_init_var_steps[b], n_dims[e], n_init_var_orders[e])
+    steps: (..., n_steps-1[b])
     return: (..., n_steps, n_dims, n_orders)
     """
 
     dtype = coefficients.dtype
     device: torch.device = coefficients.device
 
-    *batches, n_steps, n_equations, n_dims, n_orders = coefficients.shape
-    *_, n_init_var_steps, _, n_init_var_orders = rhs_init.shape
-    assert n_steps, n_equations == rhs_equation.shape[-2:]
-    assert n_dims == rhs_init.shape[-2]
-    assert n_steps - 1 == steps.shape[-1]
+    n_steps = steps.size(-1) + 1 if n_steps is None else n_steps
+    assert n_steps >= 2
+    n_init_var_steps = rhs_init.size(-3) if n_init_var_steps is None else n_init_var_steps
+
+    *batch_coefficients, n_steps_coefficients, n_equations, n_dims, n_orders = coefficients.shape
+    assert n_steps_coefficients in [n_steps, 1]
+    *batch_rhs_equation, n_steps_rhs_equation, n_equations_rhs_equation = rhs_equation.shape
+    assert n_steps_rhs_equation in [n_steps, 1] and n_equations_rhs_equation == n_equations
+    *batch_rhs_init, n_init_var_steps_rhs_init, n_dims_rhs_init, n_init_var_orders = rhs_init.shape
+    assert n_init_var_steps_rhs_init in [n_init_var_steps, 1] and n_dims_rhs_init == n_dims
+    *batch_steps, n_steps_steps = steps.shape
+    assert n_steps_steps in [n_steps - 1, 1]
+    batches = torch.broadcast_shapes(batch_coefficients, batch_rhs_equation, batch_rhs_init, batch_steps)
 
     # ode equation constraints
-    c = coefficients.flatten(start_dim=-2)  # (..., n_steps, n_equations, n_dims * n_orders)
-    ct = c.transpose(-2, -1)  # (..., n_steps, n_dims * n_orders, n_equations)
-    block_diag_0 = ct @ c  # (..., n_steps, n_dims * n_orders, n_dims * n_orders)
-    beta = (ct @ rhs_equation[..., None])  # (..., n_steps, n_dims * n_orders, 1)
+    c = coefficients.flatten(start_dim=-2)  # (..., n_steps[b], n_equations, n_dims * n_orders)
+    ct = c.transpose(-2, -1)  # (..., n_steps[b], n_dims * n_orders, n_equations)
+    block_diag_0 = ct @ c  # (..., n_steps[b], n_dims * n_orders, n_dims * n_orders)
+    beta = ct @ rhs_equation[..., None]  # (..., n_steps[b], n_dims * n_orders, 1)
+
+    block_diag_0 = block_diag_0.repeat(
+        *[ss // s for ss, s in zip(batches, block_diag_0.shape[:-3])],
+        n_steps // block_diag_0.size(-3),
+        1,
+        1,
+    )  # (..., n_steps, n_dims * n_orders, n_dims * n_orders)
+    beta = beta.repeat(
+        *[ss // s for ss, s in zip(batches, beta.shape[:-3])],
+        n_steps // beta.size(-3),
+        1,
+        1,
+    )  # (..., n_steps, n_dims * n_orders, 1)
 
     # initial-value constraints
     init_idx = torch.arange(n_init_var_orders, device=device).repeat(n_dims) \
@@ -45,22 +68,30 @@ def ode_forward(
     sign_vec = order_idx % 2 * (-2) + 1  # (n_orders)
     sign_map = sign_vec * sign_vec[:, None]  # (n_orders, n_orders)
 
-    expansions = steps[..., None] ** order_idx  # (..., n_steps-1, n_orders)
-    et_e_diag = expansions ** 2  # (..., n_steps-1, n_orders)
+    expansions = steps[..., None] ** order_idx  # (..., n_steps-1[b], n_orders)
+    et_e_diag = expansions ** 2  # (..., n_steps-1[b], n_orders)
     et_e_diag[..., -1] = 0.
     factorials = (-(order_idx - order_idx[:, None] + 1).triu().lgamma()).exp()  # (n_orders, n_orders)
     factorials[-1, -1] = 0.
-    e_outer = expansions[..., None] * expansions[..., None, :]  # (..., n_steps-1, n_orders, n_orders)
-    et_ft_f_e = e_outer * (factorials.t() @ factorials)  # (..., n_steps-1, n_orders, n_orders)
+    e_outer = expansions[..., None] * expansions[..., None, :]  # (..., n_steps-1[b], n_orders, n_orders)
+    et_ft_f_e = e_outer * (factorials.t() @ factorials)  # (..., n_steps-1[b], n_orders, n_orders)
 
     smooth_block_diag_1 = e_outer * -(factorials + factorials.transpose(-2, -1) * sign_map)
-    # (..., n_steps-1, n_orders, n_orders)
+    # (..., n_steps-1[b], n_orders, n_orders)
     smooth_block_diag_0 = torch.zeros(*batches, n_steps, n_orders, n_orders, dtype=dtype, device=device)
     # (..., n_steps, n_orders, n_orders)
     smooth_block_diag_0[..., :-1, :, :] += et_ft_f_e
     smooth_block_diag_0[..., 1:, :, :] += et_ft_f_e * sign_map
     smooth_block_diag_0[..., :-1, order_idx, order_idx] += et_e_diag
     smooth_block_diag_0[..., 1:, order_idx, order_idx] += et_e_diag
+
+    smooth_block_diag_1 = smooth_block_diag_1.repeat(
+        *([1] * len(batches)),
+        (n_steps - 1) // smooth_block_diag_1.size(-3),
+        1,
+        1,
+    )  # (..., n_steps-1, n_orders, n_orders)
+    steps = steps.repeat(*([1] * len(batches)), (n_steps - 1) // steps.size(-1))  # (..., n_steps-1)
 
     # smoothness constraints (central)
     steps2 = steps[..., :-1] + steps[..., 1:]  # (..., n_steps-2)
@@ -170,7 +201,7 @@ def test():
     steps = torch.nn.Parameter(torch.randn(*batches, n_steps - 1, dtype=dtype, device=device))
     u = ode_forward(coefficients, rhs_equation, rhs_init, steps)
     u.sum().backward()
-    a = 0
+    u = None
 
 
 if __name__ == '__main__':

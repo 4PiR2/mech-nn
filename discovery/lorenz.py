@@ -116,18 +116,21 @@ class Model(nn.Module):
 
         rhs = var_basis @ xi  # (bs, 50, 3)
         rhs = rhs.permute(0, 2, 1)    # (bs, 3, 50)
-        rhs = rhs.reshape(-1, self.n_step_per_batch, 1)
+        # rhs = rhs.reshape(-1, self.n_step_per_batch, 1)
+        rhs = rhs.reshape(-1, 3, self.n_step_per_batch, 1)
 
         z = torch.zeros(1, self.n_ind_dim, 1, 1).type_as(net_iv)
         o = torch.ones(1, self.n_ind_dim, 1, 1).type_as(net_iv)
 
         coeffs = torch.cat([z, o, z], dim=-1)  # (1, 3, 1, 3)
-        coeffs = coeffs.repeat(self.bs, 1, self.n_step_per_batch, 1)  # (bs, 3, 50, 3)
-        coeffs = coeffs.reshape(-1, self.n_step_per_batch, 1, 1, 3)
+        # coeffs = coeffs.repeat(self.bs, 1, self.n_step_per_batch, 1)  # (bs, 3, 50, 3)
+        # coeffs = coeffs.reshape(-1, self.n_step_per_batch, 1, 1, 3)
+        coeffs = coeffs.reshape(1, 3, 1, 1, 1, 3)
 
-        steps = self.step_size.type_as(net_iv).repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1).reshape(-1, self.n_step_per_batch-1)
+        # steps = self.step_size.type_as(net_iv).repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1).reshape(-1, self.n_step_per_batch-1)
+        steps = self.step_size.type_as(net_iv).reshape(1, 1, 1)
 
-        u = ode_forward(coeffs, rhs, var[:, 0, :].reshape(self.bs * self.n_ind_dim, 1, 1, 1), steps)
+        u = ode_forward(coeffs, rhs, var[:, 0, :].reshape(self.bs, self.n_ind_dim, 1, 1, 1), steps, n_steps=self.n_step_per_batch)
 
         x0 = u.reshape(self.bs, 3, self.n_step_per_batch, 3)[..., 0].permute(0, 2, 1)
 
