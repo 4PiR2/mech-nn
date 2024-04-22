@@ -1,3 +1,6 @@
+import itertools
+import math
+
 import torch
 
 
@@ -71,7 +74,7 @@ def ode_forward(
     expansions = steps[..., None] ** order_idx  # (..., n_steps-1[b], n_orders)
     et_e_diag = expansions ** 2  # (..., n_steps-1[b], n_orders)
     et_e_diag[..., -1] = 0.
-    factorials = (-(order_idx - order_idx[:, None] + 1).triu().lgamma()).exp()  # (n_orders, n_orders)
+    factorials = (-(order_idx - order_idx[:, None] + 1).triu().to(dtype=dtype).lgamma()).exp()  # (n_orders, n_orders)
     factorials[-1, -1] = 0.
     e_outer = expansions[..., None] * expansions[..., None, :]  # (..., n_steps-1[b], n_orders, n_orders)
     et_ft_f_e = e_outer * (factorials.t() @ factorials)  # (..., n_steps-1[b], n_orders, n_orders)
@@ -188,6 +191,66 @@ def ode_forward(
     return u
 
 
+def ode_forward_baseline(
+        coefficients: torch.Tensor,
+        rhs_equation: torch.Tensor,
+        rhs_init: torch.Tensor,
+        steps: torch.Tensor,
+) -> torch.Tensor:
+    """
+    coefficients: (..., n_steps, n_equations, n_dims, n_orders)
+    rhs_equation: (..., n_steps, n_equations)
+    rhs_init: (..., n_init_var_steps, n_dims, n_init_var_orders)
+    steps: (..., n_steps-1)
+    return: (..., n_steps, n_dims, n_orders)
+    """
+    dtype = coefficients.dtype
+    device: torch.device = coefficients.device
+
+    *batches, n_steps, n_equations, n_dims, n_orders = coefficients.shape
+    *_, n_init_var_steps, _, n_init_var_orders = rhs_init.shape
+
+    A_eq = torch.zeros(*batches, n_steps * n_equations, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+    for i, (step, equation) in enumerate(itertools.product(range(n_steps), range(n_equations))):
+        A_eq[..., i, step * n_dims * n_orders: (step + 1) * n_dims * n_orders] \
+            = coefficients[..., step, equation, :, :].flatten(start_dim=-2)
+    beta_eq = rhs_equation.flatten(start_dim=-2)
+
+    A_in = torch.zeros(*batches, n_init_var_steps * n_dims * n_init_var_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+    for i, (step, dim, order) in enumerate(itertools.product(range(n_init_var_steps), range(n_dims), range(n_init_var_orders))):
+        A_in[..., i, (step * n_dims + dim) * n_orders + order] = 1.
+    beta_in = rhs_init.flatten(start_dim=-3)
+
+    A_sf = torch.zeros(*batches, (n_steps - 1) * n_dims * (n_orders - 1), n_steps * n_dims * n_orders, dtype=dtype, device=device)
+    for i, (step, dim, order) in enumerate(itertools.product(range(n_steps - 1), range(n_dims), range(n_orders - 1))):
+        for o in range(order, n_orders):
+            A_sf[..., i, (step * n_dims + dim) * n_orders + o] = steps[..., step] ** o / math.factorial(o - order)
+        A_sf[..., i, ((step + 1) * n_dims + dim) * n_orders + order] = - steps[..., step] ** order
+
+    A_sb = torch.zeros(*batches, (n_steps - 1) * n_dims * (n_orders - 1), n_steps * n_dims * n_orders, dtype=dtype, device=device)
+    for i, (step, dim, order) in enumerate(itertools.product(range(n_steps - 1), range(n_dims), range(n_orders - 1))):
+        for o in range(order, n_orders):
+            A_sb[..., i, ((step + 1) * n_dims + dim) * n_orders + o] = (- steps[..., step]) ** o / math.factorial(o - order)
+        A_sb[..., i, (step * n_dims + dim) * n_orders + order] = - (- steps[..., step]) ** order
+
+    A_sc = torch.zeros(*batches, (n_steps - 2) * n_dims, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+    for i, (step, dim) in enumerate(itertools.product(range(n_steps - 2), range(n_dims))):
+        A_sc[..., i, (step * n_dims + dim) * n_orders + (n_orders - 2)] = (steps[..., step] + steps[..., step + 1]) ** (n_orders - 3)
+        A_sc[..., i, ((step + 1) * n_dims + dim) * n_orders + (n_orders - 1)] = (steps[..., step] + steps[..., step + 1]) ** (n_orders - 2)
+        A_sc[..., i, ((step + 2) * n_dims + dim) * n_orders + (n_orders - 2)] = - (steps[..., step] + steps[..., step + 1]) ** (n_orders - 3)
+
+    A = torch.cat([A_eq, A_in, A_sb, A_sc, A_sf], dim=-2)
+    beta = torch.cat([beta_eq, beta_in, torch.zeros_like(A_sf[..., 0]), torch.zeros_like(A_sc[..., 0]), torch.zeros_like(A_sb[..., 0])], dim=-1)
+
+    AtA = A.transpose(-2, -1) @ A
+    Atb = A.transpose(-2, -1) @ beta[..., None]
+
+    L, info = torch.linalg.cholesky_ex(AtA, upper=False, check_errors=False)
+    u = Atb.cholesky_solve(L, upper=False)
+    u = u.reshape(*batches, n_steps, n_dims, n_orders)
+    return u
+
+
 def test():
     torch.autograd.set_detect_anomaly(mode=True, check_nan=True)
     dtype = torch.float64
@@ -198,9 +261,13 @@ def test():
     coefficients = torch.nn.Parameter(torch.randn(*batches, n_steps, n_equations, n_dims, n_orders, dtype=dtype, device=device))
     rhs_equation = torch.nn.Parameter(torch.randn(*batches, n_steps, n_equations, dtype=dtype, device=device))
     rhs_init = torch.nn.Parameter(torch.randn(*batches, n_init_var_steps, n_dims, n_init_var_orders, dtype=dtype, device=device))
-    steps = torch.nn.Parameter(torch.randn(*batches, n_steps - 1, dtype=dtype, device=device))
+    steps = torch.nn.Parameter(torch.rand(*batches, n_steps - 1, dtype=dtype, device=device))
     u = ode_forward(coefficients, rhs_equation, rhs_init, steps)
+    u0 = ode_forward_baseline(coefficients, rhs_equation, rhs_init, steps)
+    diff = u - u0
+    print(diff.abs().max().item())
     u.sum().backward()
+    u0.sum().backward()
     u = None
 
 
