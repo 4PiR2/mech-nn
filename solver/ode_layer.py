@@ -84,43 +84,74 @@ def ode_forward(
         block_diag_1[..., i1:i2, i1:i2] = smooth_block_diag_1
         block_diag_2[..., i1:i2, i1:i2] = smooth_block_diag_2
 
-    # in-place blocked cholesky decomposition
+    # blocked cholesky decomposition
+    block_diag_0_list: list[torch.Tensor | None] = list(block_diag_0.unbind(dim=-3))
+    block_diag_1_list: list[torch.Tensor | None] = list(block_diag_1.unbind(dim=-3))
+    block_diag_2_list: list[torch.Tensor | None] = list(block_diag_2.unbind(dim=-3))
     for step in range(n_steps):
         if step >= 2:
-            block_diag_2[..., step - 2, :, :] = torch.linalg.solve_triangular(
-                block_diag_0[..., step - 2, :, :].transpose(-2, -1),
-                block_diag_2[..., step - 2, :, :],
+            block_diag_2_list[step - 2] = torch.linalg.solve_triangular(
+                block_diag_0_list[step - 2].transpose(-2, -1),
+                block_diag_2_list[step - 2],
                 upper=True,
                 left=False,
             )
-            block_diag_1[..., step - 1, :, :] -= block_diag_2[..., step - 2, :, :] @ block_diag_1[..., step - 2, :, :].transpose(-2, -1)
+            block_diag_1_list[step - 1] = block_diag_1_list[step - 1] - block_diag_2_list[step - 2] @ block_diag_1_list[step - 2].transpose(-2, -1)
         if step >= 1:
-            block_diag_1[..., step - 1, :, :] = torch.linalg.solve_triangular(
-                block_diag_0[..., step - 1, :, :].transpose(-2, -1),
-                block_diag_1[..., step - 1, :, :],
+            block_diag_1_list[step - 1] = torch.linalg.solve_triangular(
+                block_diag_0_list[step - 1].transpose(-2, -1),
+                block_diag_1_list[step - 1],
                 upper=True,
                 left=False,
             )
             if step >= 2:
-                block_diag_0[..., step, :, :] -= block_diag_2[..., step - 2, :, :] @ block_diag_2[..., step - 2, :, :].transpose(-2, -1)
-            block_diag_0[..., step, :, :] -= block_diag_1[..., step - 1, :, :] @ block_diag_1[..., step - 1, :, :].transpose(-2, -1)
-        block_diag_0[..., step, :, :], _ = torch.linalg.cholesky_ex(
-            block_diag_0[..., step, :, :],
+                block_diag_0_list[step] = block_diag_0_list[step] - block_diag_2_list[step - 2] @ block_diag_2_list[step - 2].transpose(-2, -1)
+            block_diag_0_list[step] = block_diag_0_list[step] - block_diag_1_list[step - 1] @ block_diag_1_list[step - 1].transpose(-2, -1)
+        block_diag_0_list[step], _ = torch.linalg.cholesky_ex(
+            block_diag_0_list[step],
             upper=False,
             check_errors=False,
         )
+    block_diag_0 = torch.stack(block_diag_0_list, dim=-3)
+    block_diag_1 = torch.stack(block_diag_1_list, dim=-3)
+    block_diag_2 = torch.stack(block_diag_2_list, dim=-3)
 
-    L = torch.zeros(*batches, n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
-    for step in range(n_steps):
-        L[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
-    for step in range(n_steps-1):
-        L[..., (step+1) * n_dims * n_orders: (step+2) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_1[..., step, :, :]
-    for step in range(n_steps-2):
-        L[..., (step+2) * n_dims * n_orders: (step+3) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_2[..., step, :, :]
+    # for step in range(n_steps):
+    #     if step >= 2:
+    #         block_diag_2[..., step - 2, :, :] = torch.linalg.solve_triangular(
+    #             block_diag_0[..., step - 2, :, :].transpose(-2, -1),
+    #             block_diag_2[..., step - 2, :, :],
+    #             upper=True,
+    #             left=False,
+    #         )
+    #         block_diag_1[..., step - 1, :, :] -= block_diag_2[..., step - 2, :, :] @ block_diag_1[..., step - 2, :, :].transpose(-2, -1)
+    #     if step >= 1:
+    #         block_diag_1[..., step - 1, :, :] = torch.linalg.solve_triangular(
+    #             block_diag_0[..., step - 1, :, :].transpose(-2, -1),
+    #             block_diag_1[..., step - 1, :, :],
+    #             upper=True,
+    #             left=False,
+    #         )
+    #         if step >= 2:
+    #             block_diag_0[..., step, :, :] -= block_diag_2[..., step - 2, :, :] @ block_diag_2[..., step - 2, :, :].transpose(-2, -1)
+    #         block_diag_0[..., step, :, :] -= block_diag_1[..., step - 1, :, :] @ block_diag_1[..., step - 1, :, :].transpose(-2, -1)
+    #     block_diag_0[..., step, :, :], _ = torch.linalg.cholesky_ex(
+    #         block_diag_0[..., step, :, :],
+    #         upper=False,
+    #         check_errors=False,
+    #     )
 
-    x0 = beta.flatten(start_dim=-3, end_dim=-2).cholesky_solve(L, upper=False)  # (..., n_steps * n_dims * n_orders, 1)
-    y1 = torch.linalg.solve_triangular(L, beta.flatten(start_dim=-3, end_dim=-2), upper=False, left=True)
-    x1 = torch.linalg.solve_triangular(L.transpose(-2, -1), y1, upper=True, left=True)
+    # L = torch.zeros(*batches, n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+    # for step in range(n_steps):
+    #     L[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
+    # for step in range(n_steps-1):
+    #     L[..., (step+1) * n_dims * n_orders: (step+2) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_1[..., step, :, :]
+    # for step in range(n_steps-2):
+    #     L[..., (step+2) * n_dims * n_orders: (step+3) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_2[..., step, :, :]
+    #
+    # x0 = beta.flatten(start_dim=-3, end_dim=-2).cholesky_solve(L, upper=False)  # (..., n_steps * n_dims * n_orders, 1)
+    # y1 = torch.linalg.solve_triangular(L, beta.flatten(start_dim=-3, end_dim=-2), upper=False, left=True)
+    # x1 = torch.linalg.solve_triangular(L.transpose(-2, -1), y1, upper=True, left=True)
 
     # A X = B => L (Lt X) = B
     # solve L Y = B, block forward substitution
