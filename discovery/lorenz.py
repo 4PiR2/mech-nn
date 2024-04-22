@@ -13,8 +13,7 @@ import discovery.plot as P
 import extras.logger as logger
 from extras.source import write_source_files, create_log_dir
 
-from solver.ode_layer import ODEINDLayer as ODEINDLayer0
-from solver.ode_layer import ODEINDLayer
+from solver.ode_layer import ode_forward
 
 
 class LorenzDataset(Dataset):
@@ -74,15 +73,6 @@ class Model(nn.Module):
         self.xi = nn.Parameter(self.init_xi)
         self.param_in = nn.Parameter(torch.randn(1, 64))
 
-        self.ode0 = ODEINDLayer0(
-            bs=bs, order=self.order, n_ind_dim=self.n_ind_dim, n_step=self.n_step_per_batch, solver_dbl=True,
-            double_ret=True, n_iv=1, n_iv_steps=1,  gamma=.05, alpha=0, **kwargs,
-        )
-        self.ode = ODEINDLayer(
-            bs=bs, order=self.order, n_ind_dim=self.n_ind_dim, n_step=self.n_step_per_batch, solver_dbl=True,
-            double_ret=True, n_iv=1, n_iv_steps=1,  gamma=.05, alpha=0, **kwargs,
-        )
-
         self.param_net = nn.Sequential(
             nn.Linear(64, 1024),
             nn.ReLU(),
@@ -137,7 +127,7 @@ class Model(nn.Module):
 
         steps = self.step_size.type_as(net_iv).repeat(self.bs, self.n_ind_dim, self.n_step_per_batch-1).reshape(-1, self.n_step_per_batch-1)
 
-        u = self.ode(coeffs, rhs, var[:, 0, :].reshape(self.bs * self.n_ind_dim, 1, 1, 1), steps)
+        u = ode_forward(coeffs, rhs, var[:, 0, :].reshape(self.bs * self.n_ind_dim, 1, 1, 1), steps)
 
         x0 = u.reshape(self.bs, 3, self.n_step_per_batch, 3)[..., 0].permute(0, 2, 1)
 
