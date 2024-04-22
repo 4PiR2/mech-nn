@@ -136,14 +136,39 @@ class ODEINDLayer(nn.Module):
                 out=(block_diag_0[..., step, :, :], torch.empty(*batches, dtype=torch.int, device=device)),
             )
 
-        L = torch.zeros(*batches, n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
-        for step in range(n_steps):
-            L[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
-        for step in range(n_steps-1):
-            L[..., (step+1) * n_orders: (step+2) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_1[..., step, :, :]
-        for step in range(n_steps-2):
-            L[..., (step+2) * n_orders: (step+3) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_2[..., step, :, :]
+        # L = torch.zeros(*batches, n_steps * n_dims * n_orders, n_steps * n_dims * n_orders, dtype=dtype, device=device)
+        # for step in range(n_steps):
+        #     L[..., step * n_dims * n_orders: (step+1) * n_dims * n_orders, step * n_dims * n_orders: (step+1) * n_dims * n_orders] = block_diag_0[..., step, :, :]
+        # for step in range(n_steps-1):
+        #     L[..., (step+1) * n_orders: (step+2) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_1[..., step, :, :]
+        # for step in range(n_steps-2):
+        #     L[..., (step+2) * n_orders: (step+3) * n_orders, step * n_orders: (step+1) * n_orders] = block_diag_2[..., step, :, :]
 
-        x = beta.flatten(start_dim=-3, end_dim=-2).cholesky_solve(L, upper=False)  # (..., n_steps * n_dims * n_orders, 1)
-        x = x.reshape(*batches, n_steps, n_dims, n_orders)
+        # x0 = beta.flatten(start_dim=-3, end_dim=-2).cholesky_solve(L, upper=False)  # (..., n_steps * n_dims * n_orders, 1)
+        # y = torch.linalg.solve_triangular(L, beta.flatten(start_dim=-3, end_dim=-2), upper=False, left=True)
+        # x0 = torch.linalg.solve_triangular(L.transpose(-2, -1), y, upper=True, left=True)
+
+        # A X = B => L (Lt X) = B
+        # solve L Y = B, in-place block forward substitution
+        for step in range(n_steps):
+            beta[..., step, :, :] = torch.linalg.solve_triangular(block_diag_0[..., step, :, :], beta[..., step, :, :], upper=False, left=True)
+            # function with "out=" does not support auto-diff
+            if step < n_steps - 1:
+                beta[..., step + 1, :, :] -= block_diag_1[..., step, :, :] @ beta[..., step, :, :]
+            if step < n_steps - 2:
+                beta[..., step + 2, :, :] -= block_diag_2[..., step, :, :] @ beta[..., step, :, :]
+
+        block_diag_0 = block_diag_0.transpose(-2, -1)
+        block_diag_1 = block_diag_1.transpose(-2, -1)
+        block_diag_2 = block_diag_2.transpose(-2, -1)
+
+        # solve Lt X = Y, in-place block backward substitution
+        for step in range(n_steps - 1, -1, -1):
+            beta[..., step, :, :] = torch.linalg.solve_triangular(block_diag_0[..., step, :, :], beta[..., step, :, :], upper=True, left=True)
+            if step >= 1:
+                beta[..., step - 1, :, :] -= block_diag_1[..., step - 1, :, :] @ beta[..., step, :, :]
+            if step >= 2:
+                beta[..., step - 2, :, :] -= block_diag_2[..., step - 2, :, :] @ beta[..., step, :, :]
+
+        x = beta.reshape(*batches, n_steps, n_dims, n_orders)
         return x
