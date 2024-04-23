@@ -2,7 +2,6 @@ import os
 
 import numpy as np
 from scipy.integrate import odeint
-from scipy.special import logit
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
