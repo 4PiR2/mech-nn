@@ -222,5 +222,5 @@ def basis_repr(coeffs, basis_vars):
 
         for j in range(n_basis):
             cc = coeffs[j,i].item()
-            repr[key] += f' + {cc:.4f}*{basis_vars[j]}'
+            repr[key] += f' + {cc}*{basis_vars[j]}'
     return repr

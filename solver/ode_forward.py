@@ -20,12 +20,12 @@ def ode_forward(
     return: (..., n_steps, n_dims, n_orders)
     """
 
-    dtype = coefficients.dtype
+    dtype: torch.dtype = coefficients.dtype
     device: torch.device = coefficients.device
 
-    n_steps = steps.size(-1) + 1 if n_steps is None else n_steps
+    n_steps: int = steps.size(-1) + 1 if n_steps is None else n_steps
     assert n_steps >= 2
-    n_init_var_steps = rhs_init.size(-3) if n_init_var_steps is None else n_init_var_steps
+    n_init_var_steps: int = rhs_init.size(-3) if n_init_var_steps is None else n_init_var_steps
 
     *batch_coefficients, n_steps_coefficients, n_equations, n_dims, n_orders = coefficients.shape
     assert n_steps_coefficients in [n_steps, 1]
@@ -35,30 +35,31 @@ def ode_forward(
     assert n_init_var_steps_rhs_init in [n_init_var_steps, 1] and n_dims_rhs_init == n_dims
     *batch_steps, n_steps_steps = steps.shape
     assert n_steps_steps in [n_steps - 1, 1]
-    batches = torch.broadcast_shapes(batch_coefficients, batch_rhs_equation, batch_rhs_init, batch_steps)
+    batch_lhs: torch.Size = torch.broadcast_shapes(batch_coefficients, batch_steps)
+    batch: torch.Size = torch.broadcast_shapes(batch_lhs, batch_rhs_equation, batch_rhs_init)
 
     # ode equation constraints
-    c = coefficients.flatten(start_dim=-2)  # (..., n_steps[b], n_equations, n_dims * n_orders)
-    ct = c.transpose(-2, -1)  # (..., n_steps[b], n_dims * n_orders, n_equations)
-    block_diag_0 = ct @ c  # (..., n_steps[b], n_dims * n_orders, n_dims * n_orders)
-    beta = ct @ rhs_equation[..., None]  # (..., n_steps[b], n_dims * n_orders, 1)
+    c: torch.Tensor = coefficients.flatten(start_dim=-2)  # (..., n_steps[b], n_equations, n_dims * n_orders)
+    ct: torch.Tensor = c.transpose(-2, -1)  # (..., n_steps[b], n_dims * n_orders, n_equations)
+    block_diag_0: torch.Tensor = ct @ c  # (..., n_steps[b], n_dims * n_orders, n_dims * n_orders)
+    beta: torch.Tensor = ct @ rhs_equation[..., None]  # (..., n_steps[b], n_dims * n_orders, 1)
 
-    block_diag_0 = block_diag_0.repeat(
-        *[ss // s for ss, s in zip(batches, block_diag_0.shape[:-3])],
+    block_diag_0: torch.Tensor = block_diag_0.repeat(
+        *[ss // s for ss, s in zip(batch_lhs, block_diag_0.shape[:-3])],
         n_steps // block_diag_0.size(-3),
         1,
         1,
     )  # (..., n_steps, n_dims * n_orders, n_dims * n_orders)
-    beta = beta.repeat(
-        *[ss // s for ss, s in zip(batches, beta.shape[:-3])],
+    beta: torch.Tensor = beta.repeat(
+        *[ss // s for ss, s in zip(batch, beta.shape[:-3])],
         n_steps // beta.size(-3),
         1,
         1,
     )  # (..., n_steps, n_dims * n_orders, 1)
 
     # initial-value constraints
-    init_idx = torch.arange(n_init_var_orders, device=device).repeat(n_dims) \
-               + n_orders * torch.arange(n_dims, device=device).repeat_interleave(n_init_var_orders)
+    init_idx: torch.Tensor = torch.arange(n_init_var_orders, device=device).repeat(n_dims) \
+                             + n_orders * torch.arange(n_dims, device=device).repeat_interleave(n_init_var_orders)
     # (n_dims * n_init_var_orders)
     block_diag_0[..., :n_init_var_steps, init_idx, init_idx] += 1.
     beta[..., :n_init_var_steps, :, 0] += torch.cat([
@@ -67,58 +68,59 @@ def ode_forward(
     ], dim=-1).flatten(start_dim=-2)
 
     # smoothness constraints (forward & backward)
-    order_idx = torch.arange(n_orders, device=device)  # (n_orders)
-    sign_vec = order_idx % 2 * (-2) + 1  # (n_orders)
-    sign_map = sign_vec * sign_vec[:, None]  # (n_orders, n_orders)
+    order_idx: torch.Tensor = torch.arange(n_orders, device=device)  # (n_orders)
+    sign_vec: torch.Tensor = order_idx % 2 * (-2) + 1  # (n_orders)
+    sign_map: torch.Tensor = sign_vec * sign_vec[:, None]  # (n_orders, n_orders)
 
-    expansions = steps[..., None] ** order_idx  # (..., n_steps-1[b], n_orders)
-    et_e_diag = expansions ** 2  # (..., n_steps-1[b], n_orders)
+    expansions: torch.Tensor = steps[..., None] ** order_idx  # (..., n_steps-1[b], n_orders)
+    et_e_diag: torch.Tensor = expansions ** 2  # (..., n_steps-1[b], n_orders)
     et_e_diag[..., -1] = 0.
-    factorials = (-(order_idx - order_idx[:, None] + 1).triu().to(dtype=dtype).lgamma()).exp()  # (n_orders, n_orders)
+    factorials: torch.Tensor = (-(order_idx - order_idx[:, None] + 1).triu().to(dtype=dtype).lgamma()).exp()
+    # (n_orders, n_orders)
     factorials[-1, -1] = 0.
-    e_outer = expansions[..., None] * expansions[..., None, :]  # (..., n_steps-1[b], n_orders, n_orders)
-    et_ft_f_e = e_outer * (factorials.t() @ factorials)  # (..., n_steps-1[b], n_orders, n_orders)
+    e_outer: torch.Tensor = expansions[..., None] * expansions[..., None, :]  # (..., n_steps-1[b], n_orders, n_orders)
+    et_ft_f_e: torch.Tensor = e_outer * (factorials.t() @ factorials)  # (..., n_steps-1[b], n_orders, n_orders)
 
-    smooth_block_diag_1 = e_outer * -(factorials + factorials.transpose(-2, -1) * sign_map)
+    smooth_block_diag_1: torch.Tensor = e_outer * -(factorials + factorials.transpose(-2, -1) * sign_map)
     # (..., n_steps-1[b], n_orders, n_orders)
-    smooth_block_diag_0 = torch.zeros(*batches, n_steps, n_orders, n_orders, dtype=dtype, device=device)
+    smooth_block_diag_0: torch.Tensor = torch.zeros(*batch_lhs, n_steps, n_orders, n_orders, dtype=dtype, device=device)
     # (..., n_steps, n_orders, n_orders)
     smooth_block_diag_0[..., :-1, :, :] += et_ft_f_e
     smooth_block_diag_0[..., 1:, :, :] += et_ft_f_e * sign_map
     smooth_block_diag_0[..., :-1, order_idx, order_idx] += et_e_diag
     smooth_block_diag_0[..., 1:, order_idx, order_idx] += et_e_diag
 
-    smooth_block_diag_1 = smooth_block_diag_1.repeat(
-        *([1] * len(batches)),
+    smooth_block_diag_1: torch.Tensor = smooth_block_diag_1.repeat(
+        *([1] * len(batch_lhs)),
         (n_steps - 1) // smooth_block_diag_1.size(-3),
         1,
         1,
     )  # (..., n_steps-1, n_orders, n_orders)
-    steps = steps.repeat(*([1] * len(batches)), (n_steps - 1) // steps.size(-1))  # (..., n_steps-1)
+    steps: torch.Tensor = steps.repeat(*([1] * len(batch_lhs)), (n_steps - 1) // steps.size(-1))  # (..., n_steps-1)
 
     # smoothness constraints (central)
-    steps2 = steps[..., :-1] + steps[..., 1:]  # (..., n_steps-2)
-    steps26 = steps2 ** (n_orders * 2 - 6)  # (..., n_steps-2)
-    steps25 = steps2 ** (n_orders * 2 - 5)  # (..., n_steps-2)
-    steps24 = steps2 ** (n_orders * 2 - 4)  # (..., n_steps-2)
+    steps2: torch.Tensor = steps[..., :-1] + steps[..., 1:]  # (..., n_steps-2)
+    steps26: torch.Tensor = steps2 ** (n_orders * 2 - 6)  # (..., n_steps-2)
+    steps25: torch.Tensor = steps2 ** (n_orders * 2 - 5)  # (..., n_steps-2)
+    steps24: torch.Tensor = steps2 ** (n_orders * 2 - 4)  # (..., n_steps-2)
 
     smooth_block_diag_0[..., :-2, n_orders - 2, n_orders - 2] += steps26
     smooth_block_diag_0[..., 2:, n_orders - 2, n_orders - 2] += steps26
     smooth_block_diag_0[..., 1:-1, n_orders - 1, n_orders - 1] += steps24
     smooth_block_diag_1[..., :-1, n_orders - 1, n_orders - 2] += steps25
     smooth_block_diag_1[..., 1:, n_orders - 2, n_orders - 1] -= steps25
-    smooth_block_diag_2 = torch.zeros(*batches, n_steps - 2, n_orders, n_orders, dtype=dtype, device=device)
+    smooth_block_diag_2: torch.Tensor = torch.zeros(*batch_lhs, n_steps - 2, n_orders, n_orders, dtype=dtype, device=device)
     # (..., n_steps-2, n_orders, n_orders)
     smooth_block_diag_2[..., n_orders - 2, n_orders - 2] = -steps26
 
     # copy to n_dims
-    block_diag_1 = torch.zeros(*batches, n_steps - 1, n_dims * n_orders, n_dims * n_orders, dtype=dtype, device=device)
+    block_diag_1: torch.Tensor = torch.zeros(*batch_lhs, n_steps - 1, n_dims * n_orders, n_dims * n_orders, dtype=dtype, device=device)
     # (..., n_steps-1, n_dims * n_orders, n_dims * n_orders)
-    block_diag_2 = torch.zeros(*batches, n_steps - 2, n_dims * n_orders, n_dims * n_orders, dtype=dtype, device=device)
+    block_diag_2: torch.Tensor = torch.zeros(*batch_lhs, n_steps - 2, n_dims * n_orders, n_dims * n_orders, dtype=dtype, device=device)
     # (..., n_steps-2, n_dims * n_orders, n_dims * n_orders)
     for dim in range(n_dims):
-        i1 = dim * n_orders
-        i2 = (dim + 1) * n_orders
+        i1: int = dim * n_orders
+        i2: int = (dim + 1) * n_orders
         block_diag_0[..., i1:i2, i1:i2] += smooth_block_diag_0
         block_diag_1[..., i1:i2, i1:i2] = smooth_block_diag_1
         block_diag_2[..., i1:i2, i1:i2] = smooth_block_diag_2
@@ -160,7 +162,7 @@ def ode_forward(
     b_list: list[torch.Tensor] = list(beta.unbind(dim=-3))
     y_list: list[torch.Tensor | None] = [None] * n_steps
     for step in range(n_steps):
-        b_step = b_list[step]
+        b_step: torch.Tensor = b_list[step]
         if step >= 2:
             b_step = b_step - block_diag_2_list[step - 2] @ y_list[step - 2]
         if step >= 1:
@@ -175,7 +177,7 @@ def ode_forward(
     # solve Lt X = Y, block backward substitution
     x_list: list[torch.Tensor | None] = [None] * n_steps
     for step in range(n_steps - 1, -1, -1):
-        y_step = y_list[step]
+        y_step: torch.Tensor = y_list[step]
         if step < n_steps - 2:
             y_step = y_step - block_diag_2_list[step].transpose(-2, -1) @ x_list[step + 2]
         if step < n_steps - 1:
@@ -187,7 +189,8 @@ def ode_forward(
             left=True,
         )
 
-    u = torch.stack(x_list, dim=-3).reshape(*batches, n_steps, n_dims, n_orders)  # (..., n_steps, n_dims, n_orders)
+    u: torch.Tensor = torch.stack(x_list, dim=-3).reshape(*batch, n_steps, n_dims, n_orders)
+    # (..., n_steps, n_dims, n_orders)
     return u
 
 
@@ -204,7 +207,7 @@ def ode_forward_baseline(
     steps: (..., n_steps-1)
     return: (..., n_steps, n_dims, n_orders)
     """
-    dtype = coefficients.dtype
+    dtype: torch.dtype = coefficients.dtype
     device: torch.device = coefficients.device
 
     *batches, n_steps, n_equations, n_dims, n_orders = coefficients.shape
