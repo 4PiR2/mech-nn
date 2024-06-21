@@ -245,6 +245,32 @@ def ode_forward_baseline(
     A = torch.cat([A_eq, A_in, A_sb, A_sc, A_sf], dim=-2)
     beta = torch.cat([beta_eq, beta_in, torch.zeros_like(A_sf[..., 0]), torch.zeros_like(A_sc[..., 0]), torch.zeros_like(A_sb[..., 0])], dim=-1)
 
+    # Ae = torch.cat([A_eq, A_in], dim=-2)
+    # As = torch.cat([A_sb, A_sc, A_sf], dim=-2)
+    # me = Ae.size(-2)
+    # ms = As.size(-2)
+    # nv = Ae.size(-1)
+    #
+    # A = torch.zeros(*batches, me + ms + nv + ms, nv + ms + me + ms, dtype=dtype, device=device)
+    # A[..., 0:me, 0:nv] = Ae
+    # A[..., me+ms:me+ms+nv, nv+ms:nv+ms+me] = Ae.transpose(-2, -1)
+    # A[..., me:me+ms, 0:nv] = As
+    # A[..., me+ms:me+ms+nv, nv+ms+me:nv+ms+me+ms] = As.transpose(-2, -1)
+    # A[..., me:me+ms, nv:nv+ms] = torch.eye(ms, dtype=dtype, device=device)
+    # A[..., me+ms+nv:me+ms+nv+ms, nv:nv+ms] = torch.eye(ms, dtype=dtype, device=device)
+    # A[..., me+ms+nv:me+ms+nv+ms, nv+ms+me:nv+ms+me+ms] = torch.eye(ms, dtype=dtype, device=device)
+    #
+    # from PIL import Image
+    #
+    # def save_mat(matrix, fname):
+    #     matrix = matrix.bool().detach().cpu().to(dtype=torch.uint8).numpy() * 255
+    #     image = Image.fromarray(matrix)  # 'L' mode for grayscale
+    #     image.save(f'logs/img/6/{fname}.png')
+    #
+    # save_mat(A, 'a')
+    # save_mat(torch.linalg.inv(A), 'ainv')
+    # save_mat(torch.linalg.inv(A)[..., :nv, :me], 'ainv2')
+
     AtA = A.transpose(-2, -1) @ A
     Atb = A.transpose(-2, -1) @ beta[..., None]
 
@@ -259,6 +285,7 @@ def test():
     dtype = torch.float64
     device = torch.device('cuda:0')
     batches = (11,)
+    # batches = ()
     n_steps, n_equations, n_dims, n_orders = 7, 2, 3, 5
     n_init_var_steps, n_init_var_orders = 3, 4
     coefficients = torch.nn.Parameter(torch.randn(*batches, n_steps, n_equations, n_dims, n_orders, dtype=dtype, device=device))
