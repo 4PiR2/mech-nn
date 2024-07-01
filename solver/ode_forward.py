@@ -160,10 +160,10 @@ class solve_linear(torch.autograd.Function):
         pydevd.settrace(suspend=False, trace_only_current_thread=True)
         # https://discuss.pytorch.org/t/custom-backward-breakpoint-doesnt-get-hit/6473/15
         db = solve_linear.substitution(ctx.block_diag_0_list, ctx.block_diag_1_list, ctx.block_diag_2_list, beta=du)
-        ut = -ctx.u.transpose(-2, -1)  # (..., n_steps, 1, n_dims * n_orders)
-        da0 = db @ ut
-        da1 = db[..., 1:, :, :] @ ut[..., :-1, :, :]
-        da2 = db[..., 2:, :, :] @ ut[..., :-2, :, :]
+        u = -ctx.u  # (..., n_steps, n_dims * n_orders, 1)
+        da0 = db * u[..., None, :, 0]
+        da1 = db[..., 1:, :, :] * u[..., :-1, None, :, 0] + u[..., 1:, :, :] * db[..., :-1, None, :, 0]
+        da2 = db[..., 2:, :, :] * u[..., :-2, None, :, 0] + u[..., 2:, :, :] * db[..., :-2, None, :, 0]
         return da0, da1, da2, db
 
     @staticmethod
@@ -539,8 +539,13 @@ def test():
     u0 = ode_forward_baseline(coefficients, rhs_equation, rhs_init, steps)
     diff = u - u0
     print(diff.abs().max().item())
-    u.sum().backward()
+
+    var_list = [coefficients, rhs_equation, rhs_init, steps]
+    grads = [var.grad for var in var_list]
+    for var in var_list:
+        var.grad = None
     u0.sum().backward()
+    grads0 = [var.grad for var in var_list]
     u = None
 
 
